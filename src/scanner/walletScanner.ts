@@ -17,6 +17,10 @@ export interface WalletScanOptions {
   deepScan?: boolean;
 }
 
+export type DeepScanReason =
+  | 'gap_in_history'          // first+last window has an uncovered middle
+  | 'no_deposits_in_window';  // no CEX deposits found in window — may be in the middle
+
 export interface WalletScanResult {
   walletId: string;
   chain: ChainSlug;
@@ -24,8 +28,10 @@ export interface WalletScanResult {
   firstFunderFound: boolean;
   depositEvidenceFound: number;
   p2pMatchesFound: number;
-  /** true if scan used first+last window and a gap exists — queue deep_scan to fill it */
+  /** true if a deep_scan job should be queued for this wallet */
   partial: boolean;
+  /** reasons why a deep_scan was flagged (empty if partial=false) */
+  deepScanReasons: DeepScanReason[];
   durationMs: number;
   error?: string;
 }
@@ -84,6 +90,7 @@ export class WalletScanner {
           depositEvidenceFound: 0,
           p2pMatchesFound: 0,
           partial: false,
+        deepScanReasons: [],
       durationMs: Date.now() - startMs,
           error: `Wallet ${walletId} not found`,
         };
@@ -115,6 +122,7 @@ export class WalletScanner {
           depositEvidenceFound: 0,
           p2pMatchesFound: 0,
           partial: false,
+        deepScanReasons: [],
       durationMs: Date.now() - startMs,
         };
       }
@@ -159,11 +167,32 @@ export class WalletScanner {
         })
         .where(eq(wallets.id, walletId));
 
+      // Determine reasons for deep_scan recommendation
+      const deepScanReasons: DeepScanReason[] = [];
+      if (fetchResult.partial) {
+        deepScanReasons.push('gap_in_history');
+      }
+      if (fetchResult.partial && depositResult.depositsFound === 0) {
+        deepScanReasons.push('no_deposits_in_window');
+      }
+
+      // Auto-enqueue deep_scan if needed and this is not already a deep scan
+      if (deepScanReasons.length > 0 && !opts?.deepScan) {
+        const { enqueueJob } = await import('../queue/index.js');
+        await enqueueJob(walletId, chain, 'deep_scan', {}).catch((err: unknown) => {
+          console.warn(`[WalletScanner] failed to enqueue deep_scan for ${walletId}:`, err);
+        });
+        console.info(
+          `[WalletScanner] deep_scan queued for ${walletId} on ${chain} — reasons: ${deepScanReasons.join(', ')}`,
+        );
+      }
+
       return {
         walletId,
         chain,
         transactionsFetched: fetchResult.totalFetched,
-      partial: fetchResult.partial,
+        partial: fetchResult.partial,
+        deepScanReasons,
         firstFunderFound: firstFunderResult.found,
         depositEvidenceFound: depositResult.depositsFound,
         p2pMatchesFound: p2pResult.matchesFound,
@@ -181,7 +210,8 @@ export class WalletScanner {
         depositEvidenceFound: 0,
         p2pMatchesFound: 0,
         partial: false,
-      durationMs: Date.now() - startMs,
+        deepScanReasons: [],
+        durationMs: Date.now() - startMs,
         error: message,
       };
     }
