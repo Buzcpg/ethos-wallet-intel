@@ -20,6 +20,14 @@ const envSchema = z.object({
   // Scanner settings
   SCANNER_CONCURRENCY: z.coerce.number().int().positive().default(5),
   SCANNER_DELAY_MS: z.coerce.number().int().nonnegative().default(200),
+  // Transaction window scan strategy:
+  // Fetch first SCAN_WINDOW_FIRST txs (asc) + last SCAN_WINDOW_LAST txs (desc).
+  // Covers early funding signals and recent deposit/P2P activity. Skips the middle.
+  // Wallets with a gap are marked partial=true and eligible for overnight deep_scan.
+  SCAN_WINDOW_FIRST: z.coerce.number().int().positive().default(100),
+  SCAN_WINDOW_LAST:  z.coerce.number().int().positive().default(300),
+  // Delay between pages during overnight deep_scan jobs (stay within rate limits)
+  DEEP_SCAN_PAGE_DELAY_MS: z.coerce.number().int().nonnegative().default(2000),
 });
 
 const parsed = envSchema.safeParse(process.env);
