@@ -22,7 +22,7 @@ https://api.ethos.network/api/v2
 Every request must include:
 
 ```http
-X-Ethos-Client: ethos-wallet-intel@1.0.0
+X-Ethos-Client: EthosiansSybilHunter
 ```
 
 Requests without this header may be rate-limited. No auth token required for public endpoints.
@@ -69,7 +69,7 @@ Returns all wallet addresses linked to an Ethos profile.
 - Returns `ok: false` or empty array if profile has no addresses
 
 **Recommended concurrency:** max 20 simultaneous connections, 150ms between batches of 100 profiles
-**Header:** `X-Ethos-Client: ethos-wallet-intel@1.0.0`
+**Header:** `X-Ethos-Client: EthosiansSybilHunter`
 
 ---
 
