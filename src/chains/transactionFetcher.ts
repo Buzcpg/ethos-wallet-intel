@@ -25,6 +25,7 @@ export interface FetchResult {
   totalFetched: number;
   chain: ChainSlug;
   address: string;
+  partial: boolean;     // true if SCAN_MAX_PAGES cap was hit — scan is incomplete
   fromBlock?: bigint;
   toBlock?: bigint;
 }
@@ -113,7 +114,8 @@ async function fetchBlockscoutAllTxs(
   baseUrl: string,
   address: string,
   chain: ChainSlug,
-): Promise<RawTransaction[]> {
+  maxPages: number,
+): Promise<{ transactions: RawTransaction[]; partial: boolean }> {
   const addr = address.toLowerCase();
   const PAGE_DELAY = 50;
   const results: RawTransaction[] = [];
@@ -121,8 +123,16 @@ async function fetchBlockscoutAllTxs(
   // ---- Native transactions ----
   let nativeUrl: string | null =
     `${baseUrl}/addresses/${addr}/transactions?limit=100&sort=asc`;
+  let nativePages = 0;
+  let nativePartial = false;
 
   while (nativeUrl) {
+    if (nativePages >= maxPages) {
+      console.warn(`[BlockscoutFetcher:${chain}] native tx page cap (${maxPages}) hit for ${addr} — marking partial`);
+      nativePartial = true;
+      break;
+    }
+    nativePages++;
     let data: BlockscoutTxResponse;
     try {
       const resp = await fetchWithRetry(nativeUrl, 3, 1000);
@@ -164,8 +174,16 @@ async function fetchBlockscoutAllTxs(
   // ---- ERC-20 transfers ----
   let tokenUrl: string | null =
     `${baseUrl}/addresses/${addr}/token-transfers?limit=100&type=ERC-20`;
+  let tokenPages = 0;
+  let tokenPartial = false;
 
   while (tokenUrl) {
+    if (tokenPages >= maxPages) {
+      console.warn(`[BlockscoutFetcher:${chain}] ERC-20 page cap (${maxPages}) hit for ${addr} — marking partial`);
+      tokenPartial = true;
+      break;
+    }
+    tokenPages++;
     let data: BlockscoutTokenResponse;
     try {
       const resp = await fetchWithRetry(tokenUrl, 3, 1000);
@@ -207,7 +225,7 @@ async function fetchBlockscoutAllTxs(
     }
   }
 
-  return results;
+  return { transactions: results, partial: nativePartial || tokenPartial };
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +264,7 @@ async function fetchEtherscanAllTxs(
   address: string,
   chain: ChainSlug,
   apiKey: string | undefined,
-): Promise<RawTransaction[]> {
+): Promise<{ transactions: RawTransaction[]; partial: boolean }> {
   const addr = address.toLowerCase();
   const results: RawTransaction[] = [];
 
@@ -317,7 +335,9 @@ async function fetchEtherscanAllTxs(
     console.warn(`[EtherscanFetcher:${chain}] token tx fetch failed:`, err);
   }
 
-  return results;
+  // Etherscan/Snowtrace uses offset=10000 which caps at 10k txs — not truly unbounded
+  // but mark partial if exactly 10000 results returned (hit the limit)
+  return { transactions: results, partial: results.length >= 10000 };
 }
 
 // ---------------------------------------------------------------------------
@@ -337,14 +357,19 @@ export class WalletTransactionFetcher {
   async fetchAll(address: string, opts?: FetchOptions): Promise<FetchResult> {
     const addr = address.toLowerCase();
     let transactions: RawTransaction[];
+    let isPartial = false;
 
     if (this.chain in BLOCKSCOUT_CONFIGS) {
       const config = BLOCKSCOUT_CONFIGS[this.chain]!;
-      transactions = await fetchBlockscoutAllTxs(config.baseUrl, addr, this.chain);
+      const result = await fetchBlockscoutAllTxs(config.baseUrl, addr, this.chain, env.SCAN_MAX_PAGES);
+      transactions = result.transactions;
+      isPartial = result.partial;
     } else if (this.chain in ETHERSCAN_CONFIGS) {
       const config = ETHERSCAN_CONFIGS[this.chain]!;
       const apiKey = env[config.envKey as keyof typeof env] as string | undefined;
-      transactions = await fetchEtherscanAllTxs(config.baseUrl, addr, this.chain, apiKey);
+      const result = await fetchEtherscanAllTxs(config.baseUrl, addr, this.chain, apiKey);
+      transactions = result.transactions;
+      isPartial = result.partial;
     } else {
       throw new Error(`WalletTransactionFetcher: unsupported chain "${this.chain}"`);
     }
@@ -373,6 +398,7 @@ export class WalletTransactionFetcher {
     return {
       transactions: deduped,
       totalFetched: deduped.length,
+      partial: isPartial,
       chain: this.chain,
       address: addr,
       ...(fromBlock !== undefined ? { fromBlock } : {}),

@@ -20,6 +20,9 @@ const envSchema = z.object({
   // Scanner settings
   SCANNER_CONCURRENCY: z.coerce.number().int().positive().default(5),
   SCANNER_DELAY_MS: z.coerce.number().int().nonnegative().default(200),
+  // Max pages to fetch per wallet scan (100 txs/page). Prevents runaway fetches on high-activity wallets.
+  // Wallets hitting this cap are marked partial=true in FetchResult. Default 5 pages = 500 txs.
+  SCAN_MAX_PAGES: z.coerce.number().int().positive().default(5),
 });
 
 const parsed = envSchema.safeParse(process.env);
