@@ -28,6 +28,11 @@ const envSchema = z.object({
   SCAN_WINDOW_LAST:  z.coerce.number().int().positive().default(300),
   // Delay between pages during overnight deep_scan jobs (stay within rate limits)
   DEEP_SCAN_PAGE_DELAY_MS: z.coerce.number().int().nonnegative().default(2000),
+  // Delta rescan settings
+  // Number of hours between rescans; wallets scanned within this window are skipped
+  RESCAN_INTERVAL_HOURS: z.coerce.number().int().positive().default(24),
+  // Max pages to fetch in a delta scan (only new transactions since last_scanned_block)
+  SCAN_MAX_PAGES_DELTA: z.coerce.number().int().positive().default(10),
 });
 
 const parsed = envSchema.safeParse(process.env);

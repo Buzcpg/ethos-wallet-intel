@@ -1,8 +1,16 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { ProfileSyncService } from '../profileSync.js';
 import { SUPPORTED_CHAINS } from '../../chains/index.js';
 import type { IEthosApiClient, EthosProfile, EthosAddressData } from '../../ethos/client.js';
 import type { Db } from '../../db/client.js';
+
+// ---------------------------------------------------------------------------
+// Mock enqueueJob — new-user fast path calls this for new wallet rows
+// ---------------------------------------------------------------------------
+
+vi.mock('../../queue/index.js', () => ({
+  enqueueJob: vi.fn().mockResolvedValue({ id: 'mock-job-id' }),
+}));
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -59,9 +67,11 @@ interface InsertedProfile {
   status: string;
 }
 
-function makeMockDb() {
+function makeMockDb(opts?: { existingWallets?: boolean }) {
   const insertedWallets: InsertedWallet[] = [];
   const insertedProfiles: InsertedProfile[] = [];
+  // Simulate whether the wallet already existed (xmax > 0) or is new (xmax = 0)
+  const existingWallets = opts?.existingWallets ?? false;
 
   const mockDb = {
     _wallets: insertedWallets,
@@ -72,22 +82,29 @@ function makeMockDb() {
 
       return {
         values: (vals: Record<string, unknown>) => ({
-          onConflictDoUpdate: (_opts: unknown) => {
-            if (name === 'wallets') {
-              insertedWallets.push(vals as unknown as InsertedWallet);
-            } else if (name === 'profiles') {
-              const p = vals as unknown as InsertedProfile;
-              const idx = insertedProfiles.findIndex(
-                (x) => x.externalProfileId === p.externalProfileId,
-              );
-              if (idx >= 0) {
-                insertedProfiles[idx] = p;
-              } else {
-                insertedProfiles.push(p);
+          onConflictDoUpdate: (_opts: unknown) => ({
+            returning: (_cols: unknown) => {
+              if (name === 'wallets') {
+                insertedWallets.push(vals as unknown as InsertedWallet);
+                // Simulate new row (xmax='0') or existing row (xmax='1')
+                return Promise.resolve([
+                  { id: vals['id'] as string, xmax: existingWallets ? '1' : '0' },
+                ]);
+              } else if (name === 'profiles') {
+                const p = vals as unknown as InsertedProfile;
+                const idx = insertedProfiles.findIndex(
+                  (x) => x.externalProfileId === p.externalProfileId,
+                );
+                if (idx >= 0) {
+                  insertedProfiles[idx] = p;
+                } else {
+                  insertedProfiles.push(p);
+                }
+                return Promise.resolve([{ id: 'mock-profile-id', xmax: '0' }]);
               }
-            }
-            return Promise.resolve();
-          },
+              return Promise.resolve([]);
+            },
+          }),
         }),
       };
     },
@@ -144,6 +161,7 @@ describe('ProfileSyncService — upsertWallets', () => {
   let service: ProfileSyncService;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     mockDb = makeMockDb();
     const dummyClient = makeMockClient([], new Map());
     service = new ProfileSyncService(dummyClient, () => mockDb as unknown as Db);
@@ -239,6 +257,38 @@ describe('ProfileSyncService — upsertWallets', () => {
 
     expect(chains).toEqual(expectedChains);
   });
+
+  it('enqueues new_user job for new wallet rows (xmax=0)', async () => {
+    const { enqueueJob } = await import('../../queue/index.js');
+    const addressData = makeAddressData({
+      allAddresses: ['0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'],
+    });
+
+    await service.upsertWallets('mock-profile-uuid-42', addressData, 'ethos_api');
+
+    // xmax=0 (new row) → new_user job enqueued for each chain
+    expect(enqueueJob).toHaveBeenCalledTimes(NUM_CHAINS);
+    expect(vi.mocked(enqueueJob).mock.calls[0]?.[2]).toBe('new_user');
+  });
+
+  it('does not enqueue new_user job for existing wallet rows (xmax>0)', async () => {
+    const { enqueueJob } = await import('../../queue/index.js');
+    // Use a mock DB that simulates existing rows
+    const existingDb = makeMockDb({ existingWallets: true });
+    const existingService = new ProfileSyncService(
+      makeMockClient([], new Map()),
+      () => existingDb as unknown as Db,
+    );
+
+    const addressData = makeAddressData({
+      allAddresses: ['0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'],
+    });
+
+    await existingService.upsertWallets('mock-profile-uuid-42', addressData, 'ethos_api');
+
+    // xmax='1' (existing row) → no new_user jobs
+    expect(enqueueJob).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -246,6 +296,10 @@ describe('ProfileSyncService — upsertWallets', () => {
 // ---------------------------------------------------------------------------
 
 describe('ProfileSyncService — runFullSync', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('processes all profiles and counts wallets correctly', async () => {
     const profile = makeProfile({ id: 1 });
     const addressData = makeAddressData({

@@ -313,6 +313,74 @@ async function fetchBlockscoutAll(
 }
 
 // ---------------------------------------------------------------------------
+// Blockscout v2 — delta scan (only txs after fromBlock, ascending, capped at N pages)
+// ---------------------------------------------------------------------------
+
+async function fetchBlockscoutDelta(
+  baseUrl: string,
+  address: string,
+  chain: ChainSlug,
+  fromBlock: bigint,
+  maxPages: number,
+  pageDelayMs: number,
+): Promise<{ transactions: RawTransaction[]; partial: false }> {
+  const addr = address.toLowerCase();
+
+  async function fetchDeltaPages<T>(
+    startUrl: string,
+    normalise: (item: T) => RawTransaction,
+    getBlockNumber: (item: T) => bigint,
+  ): Promise<RawTransaction[]> {
+    const results: RawTransaction[] = [];
+    let url: string | null = startUrl;
+    let pages = 0;
+
+    while (url && pages < maxPages) {
+      try {
+        const { items, nextUrl }: { items: T[]; nextUrl: string | null } = await fetchBlockscoutPage<T>(url);
+        pages++;
+
+        // Filter: only keep items with blockNumber >= fromBlock
+        const newItems = items.filter((item) => getBlockNumber(item) >= fromBlock);
+        results.push(...newItems.map(normalise));
+
+        // If every item on the page is below fromBlock, we're done (ascending order,
+        // so nothing further back will be in range — but we're fetching ascending
+        // so items should be in increasing block order). Stop if page is entirely old.
+        if (items.length > 0 && items.every((item) => getBlockNumber(item) < fromBlock)) {
+          break;
+        }
+
+        url = nextUrl;
+        if (url) await sleep(pageDelayMs);
+      } catch (err) {
+        console.warn(`[BlockscoutFetcher:${chain}] delta page fetch failed:`, err);
+        break;
+      }
+    }
+
+    return results;
+  }
+
+  const normTx    = (tx: BlockscoutTx) => normaliseTx(tx, addr, chain);
+  const normToken = (tx: BlockscoutTokenTransfer) => normaliseTokenTransfer(tx, addr, chain);
+
+  const nativeTxs = await fetchDeltaPages<BlockscoutTx>(
+    `${baseUrl}/addresses/${addr}/transactions?limit=100&sort=asc`,
+    normTx,
+    (tx) => BigInt(tx.block_number ?? 0),
+  );
+
+  const tokenTxs = await fetchDeltaPages<BlockscoutTokenTransfer>(
+    `${baseUrl}/addresses/${addr}/token-transfers?limit=100&type=ERC-20&sort=asc`,
+    normToken,
+    (tx) => BigInt(tx.block_number ?? 0),
+  );
+
+  return { transactions: deduplicateTxs([...nativeTxs, ...tokenTxs]), partial: false };
+}
+
+// ---------------------------------------------------------------------------
 // Etherscan/Snowtrace fetcher (Avalanche)
 // ---------------------------------------------------------------------------
 
@@ -348,6 +416,7 @@ async function fetchEtherscanAllTxs(
   address: string,
   chain: ChainSlug,
   apiKey: string | undefined,
+  fromBlock?: bigint,
 ): Promise<{ transactions: RawTransaction[]; partial: boolean }> {
   const addr = address.toLowerCase();
   const results: RawTransaction[] = [];
@@ -357,7 +426,7 @@ async function fetchEtherscanAllTxs(
       module: 'account',
       action,
       address,
-      startblock: '0',
+      startblock: fromBlock !== undefined ? fromBlock.toString() : '0',
       endblock: '99999999',
       sort: 'asc',
       offset: '10000',
@@ -437,6 +506,10 @@ export class WalletTransactionFetcher {
    *
    * opts.deepScan=true: fetch ALL txs with DEEP_SCAN_PAGE_DELAY_MS between pages.
    * Only used by overnight deep_scan jobs for flagged partial wallets.
+   *
+   * opts.fromBlock: fetch only transactions at or after this block number (delta scan).
+   * Skips the window strategy; fetches ascending from fromBlock up to
+   * SCAN_MAX_PAGES_DELTA pages. partial=false for delta scans.
    */
   async fetchAll(address: string, opts?: FetchOptions): Promise<FetchResult> {
     const addr = address.toLowerCase();
@@ -444,7 +517,15 @@ export class WalletTransactionFetcher {
 
     if (this.chain in BLOCKSCOUT_CONFIGS) {
       const { baseUrl } = BLOCKSCOUT_CONFIGS[this.chain]!;
-      if (opts?.deepScan) {
+      if (opts?.fromBlock !== undefined) {
+        // Delta scan: fetch only new txs since fromBlock
+        fetchResult = await fetchBlockscoutDelta(
+          baseUrl, addr, this.chain,
+          opts.fromBlock,
+          env.SCAN_MAX_PAGES_DELTA,
+          50,
+        );
+      } else if (opts?.deepScan) {
         fetchResult = await fetchBlockscoutAll(baseUrl, addr, this.chain, env.DEEP_SCAN_PAGE_DELAY_MS);
       } else {
         fetchResult = await fetchBlockscoutWindow(
@@ -458,7 +539,8 @@ export class WalletTransactionFetcher {
       const config = ETHERSCAN_CONFIGS[this.chain]!;
       const apiKey = env[config.envKey as keyof typeof env] as string | undefined;
       // Etherscan 10k cap is generous; deep_scan flag not needed for Avalanche
-      fetchResult = await fetchEtherscanAllTxs(config.baseUrl, addr, this.chain, apiKey);
+      // fromBlock wired directly to startblock param
+      fetchResult = await fetchEtherscanAllTxs(config.baseUrl, addr, this.chain, apiKey, opts?.fromBlock);
     } else {
       throw new Error(`WalletTransactionFetcher: unsupported chain "${this.chain}"`);
     }

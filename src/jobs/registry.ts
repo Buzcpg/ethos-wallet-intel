@@ -37,7 +37,8 @@ const backfillHandler: JobHandler = async (job) => {
 };
 
 /**
- * delta — same as backfill (WalletScanner is idempotent).
+ * delta — fetch only transactions since lastScannedBlock, run all three
+ * extractors on new data. Falls back to full scan for first-time wallets.
  */
 const deltaHandler: JobHandler = async (job) => {
   if (!job.walletId) {
@@ -49,11 +50,12 @@ const deltaHandler: JobHandler = async (job) => {
     return;
   }
 
-  console.log(`[delta] full scan — wallet ${job.walletId} on ${job.chain}`);
+  console.log(`[delta] delta scan — wallet ${job.walletId} on ${job.chain}`);
   const scanner = new WalletScanner();
-  const result = await scanner.scanWallet(job.walletId, job.chain);
+  const result = await scanner.deltaScanWallet(job.walletId, job.chain);
   console.log(`[delta] result:`, result);
 
+  // Re-run matcher to pick up any new signals discovered in delta
   const matcher = new FirstFunderMatcher();
   const matchStats = await matcher.detectMatches(job.chain);
   console.log(`[delta] match stats:`, matchStats);

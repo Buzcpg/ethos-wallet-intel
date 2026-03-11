@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { db as getDb, type Db } from '../db/client.js';
 import { profiles, wallets } from '../db/schema/index.js';
 import { SUPPORTED_CHAINS } from '../chains/index.js';
@@ -7,6 +7,7 @@ import type { ChainSlug } from '../chains/index.js';
 import { EthosApiClient } from '../ethos/client.js';
 import type { IEthosApiClient, EthosProfile, EthosAddressData } from '../ethos/client.js';
 import { env } from '../config/env.js';
+import { enqueueJob } from '../queue/index.js';
 
 export interface SyncStats {
   profilesProcessed: number;
@@ -180,6 +181,10 @@ export class ProfileSyncService {
    * Upsert wallet rows: one row per (address, chain) pair across all supported chains.
    * All addresses stored lowercase.
    * Uses onConflictDoUpdate on (address, chain) — safe to call multiple times (idempotent).
+   *
+   * New-user fast path: for genuinely new wallet rows (not previously in DB),
+   * immediately enqueues a new_user scan job without waiting for the nightly orchestrator.
+   *
    * Returns the number of rows attempted.
    */
   async upsertWallets(
@@ -197,7 +202,13 @@ export class ProfileSyncService {
         const normalised = address.toLowerCase();
         const isPrimary = normalised === (primaryAddress?.toLowerCase() ?? '');
 
-        await database
+        // Use INSERT ... ON CONFLICT and check if the row was inserted (new) vs updated.
+        // We detect "new" by checking if created_at equals updated_at (set on insert only)
+        // OR by using the returning clause and checking if createdAt is recent.
+        // Simplest: use a sentinel value — set a flag column, or query before/after.
+        // Clean approach: use INSERT ... ON CONFLICT DO UPDATE ... RETURNING xmax.
+        // xmax=0 → new row inserted; xmax>0 → existing row updated.
+        const result = await database
           .insert(wallets)
           .values({
             id: randomUUID(),
@@ -216,7 +227,23 @@ export class ProfileSyncService {
               isPrimary,
               lastSeenAt: new Date(),
             },
-          });
+          })
+          .returning({ id: wallets.id, xmax: sql<string>`xmax` });
+
+        // xmax=0 means the row was inserted (new wallet)
+        const row = result[0];
+        if (row) {
+          const isNewRow = row.xmax === '0';
+          if (isNewRow) {
+            // New-user fast path: enqueue scan immediately
+            await enqueueJob(row.id, chain, 'new_user', {}).catch((err) => {
+              console.warn(
+                `[ProfileSyncService] failed to enqueue new_user job for wallet ${row.id} on ${chain}:`,
+                err,
+              );
+            });
+          }
+        }
 
         count++;
       }

@@ -352,3 +352,77 @@ curl http://localhost:3000/scanner/p2p-stats
 | Shared first funder      | `shared_first_funder`         | 85    |
 | Direct funder            | `direct_funder`               | 95    |
 | P2P wallet interaction   | `direct_wallet_interaction`   | 70    |
+
+---
+
+## Milestone 5 — Delta Rescans
+
+Keeps wallet intelligence fresh without re-fetching full history. When a wallet has already been scanned, we know its `last_scanned_block`. A delta rescan only fetches transactions *after* that block, runs them through all three signal extractors, and updates the wallet's scan state.
+
+### How it works
+
+1. **Delta fetch** — `WalletTransactionFetcher.fetchAll()` now accepts `opts.fromBlock`. For Blockscout chains, it fetches ascending from `fromBlock` (up to `SCAN_MAX_PAGES_DELTA` pages). For Etherscan/Snowtrace, it passes `startblock` directly. The window strategy is skipped entirely.
+
+2. **`WalletScanner.deltaScanWallet(walletId, chain)`** — Loads `lastScannedBlock` from DB. If null (never scanned), falls back to a full scan. Otherwise fetches only new txs, runs all three extractors, updates scan state.
+
+3. **Rescan orchestrator** — Nightly scheduler that queries wallets overdue for a rescan and enqueues `delta` jobs.
+
+4. **New-user fast path** — When a new wallet is added during profile sync, a `new_user` scan job is enqueued immediately (no wait for the nightly orchestrator).
+
+### How to trigger
+
+```bash
+# Delta scan a single wallet
+curl -X POST http://localhost:3000/rescan/delta-wallet \
+  -H 'Content-Type: application/json' \
+  -d '{"walletId": "<uuid>", "chain": "ethereum"}'
+
+# Delta batch — scan next 50 due wallets on Base
+curl -X POST http://localhost:3000/rescan/delta-batch \
+  -H 'Content-Type: application/json' \
+  -d '{"chain": "base", "limit": 50}'
+
+# Schedule delta jobs for all overdue wallets (one chain)
+curl -X POST http://localhost:3000/rescan/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{"chain": "ethereum"}'
+
+# Schedule all chains at once
+curl -X POST http://localhost:3000/rescan/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{}'
+
+# Force rescan regardless of last_scanned_at
+curl -X POST http://localhost:3000/rescan/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{"force": true}'
+
+# Trigger profile sync delta (picks up new wallets + enqueues new_user scans)
+curl -X POST http://localhost:3000/rescan/sync-profiles
+
+# Count wallets due for rescan per chain
+curl http://localhost:3000/rescan/due-count
+```
+
+### New API routes (M5)
+
+| Method | Path                        | Description                                        |
+|--------|-----------------------------|----------------------------------------------------|
+| POST   | /rescan/delta-wallet        | Delta scan one wallet (since lastScannedBlock)     |
+| POST   | /rescan/delta-batch         | Delta scan next N due wallets on a chain           |
+| POST   | /rescan/schedule            | Enqueue delta jobs for all overdue wallets         |
+| POST   | /rescan/sync-profiles       | Trigger profile sync + new-user fast path          |
+| GET    | /rescan/due-count           | Count wallets due for rescan per chain             |
+
+### Configuration
+
+| Env var                  | Default | Description                                              |
+|--------------------------|---------|----------------------------------------------------------|
+| `RESCAN_INTERVAL_HOURS`  | `24`    | Hours between rescans; wallets within window are skipped |
+| `SCAN_MAX_PAGES_DELTA`   | `10`    | Max pages to fetch in a delta scan (new txs only)        |
+
+### New-user fast path
+
+When `ProfileSyncService.upsertWallets()` inserts a **new** wallet row (i.e., the address+chain pair didn't previously exist), it immediately enqueues a `new_user` scan job. This ensures fresh wallets are scanned within the next worker poll cycle, without waiting for the nightly `scheduleRescan`.
+
+Detection uses PostgreSQL's `xmax` system column: `xmax = 0` means the row was just inserted (new); `xmax > 0` means it was updated (existing wallet).
