@@ -164,3 +164,84 @@ Response:
 | `ETHOS_API_SLEEP_MS`    | `150`   | Sleep between batches (ms)                 |
 | `ETHOS_API_BATCH_SIZE`  | `100`   | Profiles per DB flush batch                |
 | `ETHOS_API_MAX_RETRIES` | `3`     | Retries per address fetch (exp. backoff)   |
+
+---
+
+## First Funder Scanner
+
+### How the signal works
+
+The **first funder** is the address that sent the very first inbound native token transaction (ETH, MATIC, AVAX, etc.) to a wallet on a given chain. If two or more Ethos profiles share the same first funder, that is a near-definitive sybil signal — factory wallets are typically funded from a single source.
+
+Two match types are produced:
+- **`shared_first_funder`** (score 85) — two wallets were funded by the same external address
+- **`direct_funder`** (score 95) — the funder address is itself an Ethos-tracked wallet
+
+### Chain coverage
+
+| Chain     | Adapter      | API key env var        |
+|-----------|-------------|------------------------|
+| Ethereum  | Etherscan    | `ETHERSCAN_API_KEY`    |
+| Optimism  | Etherscan    | `ETHERSCAN_API_KEY`    |
+| Polygon   | Etherscan    | `POLYGONSCAN_API_KEY`  |
+| Avalanche | Etherscan    | `SNOWTRACE_API_KEY`    |
+| Base      | Blockscout   | _(no key needed)_      |
+| Arbitrum  | Blockscout   | _(no key needed)_      |
+
+All API keys are optional. Free-tier Etherscan is rate-limited to ~5 req/s; no key means slower but still functional.
+
+### Trigger a scan
+
+```bash
+# Scan a single wallet on Ethereum
+curl -X POST http://localhost:3000/scanner/scan-wallet \
+  -H 'Content-Type: application/json' \
+  -d '{"walletId": "<uuid>", "chain": "ethereum"}'
+
+# Scan the next 100 unscanned wallets on Base
+curl -X POST http://localhost:3000/scanner/scan-batch \
+  -H 'Content-Type: application/json' \
+  -d '{"chain": "base", "limit": 100}'
+
+# Detect matches for all chains after scanning
+curl -X POST http://localhost:3000/scanner/detect-matches \
+  -H 'Content-Type: application/json' \
+  -d '{}'
+
+# Detect matches for a single chain
+curl -X POST http://localhost:3000/scanner/detect-matches \
+  -H 'Content-Type: application/json' \
+  -d '{"chain": "ethereum"}'
+```
+
+### Coverage stats
+
+```bash
+curl http://localhost:3000/scanner/stats
+```
+
+Response:
+```json
+{
+  "chains": {
+    "ethereum": {
+      "totalWallets": 240000,
+      "scanned": 12000,
+      "withFirstFunder": 9500,
+      "matches": 143
+    },
+    "base": { ... },
+    ...
+  }
+}
+```
+
+### Scanner environment variables
+
+| Variable               | Default | Description                                        |
+|------------------------|---------|----------------------------------------------------|
+| `ETHERSCAN_API_KEY`    | _(none)_ | Etherscan API key (ETH + Optimism)                |
+| `POLYGONSCAN_API_KEY`  | _(none)_ | Polygonscan key; falls back to `ETHERSCAN_API_KEY` |
+| `SNOWTRACE_API_KEY`    | _(none)_ | Snowtrace key for Avalanche                        |
+| `SCANNER_CONCURRENCY`  | `5`     | Parallel wallet scans per batch                    |
+| `SCANNER_DELAY_MS`     | `200`   | Delay between Etherscan requests (ms)              |

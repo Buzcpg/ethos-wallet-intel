@@ -4,6 +4,7 @@ import healthRoutes from './routes/health.js';
 import statusRoutes from './routes/status.js';
 import jobRoutes from './routes/jobs.js';
 import syncRoutes from './routes/sync.js';
+import scannerRoutes from './routes/scanner.js';
 
 const app = new Hono();
 
@@ -13,6 +14,7 @@ app.route('/health', healthRoutes);
 app.route('/status', statusRoutes);
 app.route('/jobs', jobRoutes);
 app.route('/sync', syncRoutes);
+app.route('/scanner', scannerRoutes);
 
 app.notFound((c) => c.json({ error: 'Not found' }, 404));
 
