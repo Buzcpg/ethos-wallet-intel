@@ -94,3 +94,73 @@ src/
 │   └── routes/          # health, status, jobs
 └── index.ts             # Entrypoint
 ```
+
+## Wallet Sync
+
+Ethos profiles and their associated wallet addresses are synced from the [Ethos public API](https://developers.ethos.network/).
+
+The sync creates one `wallets` row per `(address, chain)` pair across all 6 supported chains, using `onConflictDoUpdate` for safe, idempotent upserts.
+
+All requests include `X-Ethos-Client: EthosiansSybilHunter`.
+
+### Sync API Endpoints
+
+| Method | Path                  | Description                              |
+|--------|-----------------------|------------------------------------------|
+| POST   | /sync/profiles        | Full profile sync (all Ethos profiles)   |
+| POST   | /sync/profile/:id     | Single profile sync by Ethos profile ID  |
+
+### POST /sync/profiles
+
+Paginates through all Ethos profiles, fetches wallet addresses for each, and upserts profiles + wallets into the database.
+
+```bash
+# Full sync
+curl -X POST http://localhost:3000/sync/profiles
+
+# Dry run (counts only, no DB writes)
+curl -X POST http://localhost:3000/sync/profiles \
+  -H 'Content-Type: application/json' \
+  -d '{"dryRun": true}'
+
+# Custom batch size
+curl -X POST http://localhost:3000/sync/profiles \
+  -H 'Content-Type: application/json' \
+  -d '{"batchSize": 50}'
+```
+
+Response:
+```json
+{
+  "stats": {
+    "profilesProcessed": 42000,
+    "profilesUpserted": 38200,
+    "walletsUpserted": 229200,
+    "walletsSkipped": 3800,
+    "errors": 0,
+    "durationMs": 94210
+  }
+}
+```
+
+### POST /sync/profile/:id
+
+Syncs a single Ethos profile by its numeric profile ID.
+
+```bash
+curl -X POST http://localhost:3000/sync/profile/1234
+```
+
+Response:
+```json
+{ "profileId": 1234, "walletsUpserted": 12 }
+```
+
+### Environment Variables
+
+| Variable                | Default | Description                                |
+|-------------------------|---------|--------------------------------------------|
+| `ETHOS_API_CONCURRENCY` | `20`    | Max concurrent address fetch requests      |
+| `ETHOS_API_SLEEP_MS`    | `150`   | Sleep between batches (ms)                 |
+| `ETHOS_API_BATCH_SIZE`  | `100`   | Profiles per DB flush batch                |
+| `ETHOS_API_MAX_RETRIES` | `3`     | Retries per address fetch (exp. backoff)   |
