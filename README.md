@@ -245,3 +245,110 @@ Response:
 | `SNOWTRACE_API_KEY`    | _(none)_ | Snowtrace key for Avalanche                        |
 | `SCANNER_CONCURRENCY`  | `5`     | Parallel wallet scans per batch                    |
 | `SCANNER_DELAY_MS`     | `200`   | Delay between Etherscan requests (ms)              |
+
+---
+
+## Full Wallet Scan — Three-Signal Unified Pass (M4)
+
+### Architecture
+
+A single `WalletTransactionFetcher` fetches **all** transactions for a wallet once (paginated, native + ERC20). Three signal extractors run in parallel on the same data — no redundant API calls.
+
+```
+WalletScanner.scanWallet(walletId, chain)
+  └─ WalletTransactionFetcher.fetchAll()          ← one paginated fetch
+       ├─ FirstFunderScanner.extractFromTransactions()   Signal 1
+       ├─ DepositScanner.scanTransactions()              Signal 2
+       └─ P2PScanner.scanTransactions()                  Signal 3
+```
+
+### Signal 1 — Shared First Funder (M3 + M4 enhancement)
+
+The first inbound native transaction to the wallet. Extended in M4 with Etherscan HTML cross-verification:
+
+| Chain        | Cross-verification        | Confidence values             |
+|--------------|---------------------------|-------------------------------|
+| Ethereum     | Etherscan "Funded By" HTML | 1.0 (match), 0.7 (conflict), 0.9 (not found) |
+| Avalanche    | Snowtrace HTML (best-effort) | same as Ethereum              |
+| Base, Arbitrum, Optimism, Polygon | Blockscout (no funded-by) | 0.9 (computed) |
+
+Source values stored in `first_funder_signals.source`: `etherscan_verified`, `etherscan_conflict`, `computed`.
+
+### Signal 2 — CEX Deposit Address Detection
+
+Identifies outbound transactions to known centralised exchange addresses or deposit wallets.
+
+**Label resolution order:**
+1. `address_labels` DB cache — fastest, no network
+2. `CEX_SEED_LABELS` in-memory list — bootstrapped on startup
+3. Blockscout public tags API — checked for any chains with a Blockscout instance; result cached in DB
+
+Evidence is stored in `deposit_transfer_evidence` (one row per qualifying transaction).
+
+**Seed the label list at startup:**
+```bash
+curl -X POST http://localhost:3000/labels/seed
+```
+
+**Resolve a single address:**
+```bash
+curl -X POST http://localhost:3000/labels/resolve \
+  -H 'Content-Type: application/json' \
+  -d '{"address": "0x28c6c06298d514db089934071355e5743bf21d60", "chain": "ethereum"}'
+```
+
+### Signal 3 — P2P Direct Wallet Interaction (score: 70)
+
+Detects transactions (in or out) where the counterparty is another Ethos-tracked wallet in the `wallets` table. A single DB query checks all counterparty addresses in bulk.
+
+Match type: `direct_wallet_interaction`, score `70`. Evidence stored in `wallet_matches.evidence_json`.
+
+### API Endpoints (M4)
+
+| Method | Path                        | Description                                  |
+|--------|-----------------------------|----------------------------------------------|
+| POST   | /scanner/full-scan-wallet   | Full three-signal scan for one wallet        |
+| POST   | /scanner/full-scan-batch    | Batch full scan (unscanned wallets)          |
+| GET    | /scanner/deposit-stats      | Deposit evidence counts per chain            |
+| GET    | /scanner/p2p-stats          | P2P match counts per chain                   |
+| POST   | /labels/seed                | Seed CEX labels from static list (idempotent)|
+| POST   | /labels/resolve             | Manual label lookup + cache                  |
+
+### Full scan example
+
+```bash
+# Full scan — single wallet
+curl -X POST http://localhost:3000/scanner/full-scan-wallet \
+  -H 'Content-Type: application/json' \
+  -d '{"walletId": "<uuid>", "chain": "ethereum"}'
+
+# Response
+{
+  "walletId": "...",
+  "chain": "ethereum",
+  "transactionsFetched": 342,
+  "firstFunderFound": true,
+  "depositEvidenceFound": 3,
+  "p2pMatchesFound": 1,
+  "durationMs": 1842
+}
+
+# Batch scan — next 50 unscanned wallets on Base
+curl -X POST http://localhost:3000/scanner/full-scan-batch \
+  -H 'Content-Type: application/json' \
+  -d '{"chain": "base", "limit": 50}'
+
+# Deposit stats
+curl http://localhost:3000/scanner/deposit-stats
+
+# P2P stats
+curl http://localhost:3000/scanner/p2p-stats
+```
+
+### Signal score summary
+
+| Signal                   | Match type                    | Score |
+|--------------------------|-------------------------------|-------|
+| Shared first funder      | `shared_first_funder`         | 85    |
+| Direct funder            | `direct_funder`               | 95    |
+| P2P wallet interaction   | `direct_wallet_interaction`   | 70    |

@@ -261,3 +261,229 @@ describe('FirstFunderScanner', () => {
     expect(result.errors).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Cross-verification and extractFromTransactions tests
+// ---------------------------------------------------------------------------
+
+describe('FirstFunderScanner.extractFromTransactions', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Default: no HTML cross-verify (stub fetch to return no "Funded By")
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      text: async () => '',
+    }));
+  });
+
+  it('extracts first inbound native tx from pre-fetched list', async () => {
+    const walletRow: WalletRow = {
+      id: WALLET_ID,
+      address: WALLET_ADDRESS,
+      lastScannedAt: null,
+      lastScannedBlock: null,
+    };
+    const db = makeMockDb([], [walletRow]);
+
+    const txs: import('../../chains/transactionFetcher.js').RawTransaction[] = [
+      {
+        txHash: '0xtxhash-inbound',
+        fromAddress: '0xfunder1',
+        toAddress: WALLET_ADDRESS.toLowerCase(),
+        blockNumber: 50n,
+        blockTimestamp: new Date('2023-06-01'),
+        valueWei: '500000000000000000',
+        isInbound: true,
+        chain: CHAIN,
+      },
+    ];
+
+    const scanner = new FirstFunderScanner(() => db as never);
+    const result = await scanner.extractFromTransactions(WALLET_ID, WALLET_ADDRESS, txs, CHAIN);
+
+    expect(result.found).toBe(true);
+    expect(result.funderAddress).toBe('0xfunder1');
+    expect(result.txHash).toBe('0xtxhash-inbound');
+    expect(db._signals).toHaveLength(1);
+    expect(db._signals[0]!.confidence).toBe('0.90'); // no HTML match → computed
+  });
+
+  it('ignores ERC20 transfers when finding first native funder', async () => {
+    const walletRow: WalletRow = {
+      id: WALLET_ID,
+      address: WALLET_ADDRESS,
+      lastScannedAt: null,
+      lastScannedBlock: null,
+    };
+    const db = makeMockDb([], [walletRow]);
+
+    const txs: import('../../chains/transactionFetcher.js').RawTransaction[] = [
+      {
+        txHash: '0xtxhash-erc20',
+        fromAddress: '0xerc20sender',
+        toAddress: WALLET_ADDRESS.toLowerCase(),
+        blockNumber: 50n,
+        blockTimestamp: new Date('2023-01-01'),
+        valueWei: '0',
+        isInbound: true,
+        chain: CHAIN,
+        tokenContractAddress: '0xtokenaddr',
+        tokenSymbol: 'USDC',
+        tokenValueRaw: '1000000',
+      },
+      {
+        txHash: '0xtxhash-native',
+        fromAddress: '0xnativefunder',
+        toAddress: WALLET_ADDRESS.toLowerCase(),
+        blockNumber: 100n,
+        blockTimestamp: new Date('2023-02-01'),
+        valueWei: '1000000000000000000',
+        isInbound: true,
+        chain: CHAIN,
+      },
+    ];
+
+    const scanner = new FirstFunderScanner(() => db as never);
+    const result = await scanner.extractFromTransactions(WALLET_ID, WALLET_ADDRESS, txs, CHAIN);
+
+    expect(result.found).toBe(true);
+    // Should pick the native tx, not the ERC20
+    expect(result.funderAddress).toBe('0xnativefunder');
+  });
+
+  it('returns found=false when no native inbound txs in list', async () => {
+    const walletRow: WalletRow = {
+      id: WALLET_ID,
+      address: WALLET_ADDRESS,
+      lastScannedAt: null,
+      lastScannedBlock: null,
+    };
+    const db = makeMockDb([], [walletRow]);
+
+    const scanner = new FirstFunderScanner(() => db as never);
+    const result = await scanner.extractFromTransactions(WALLET_ID, WALLET_ADDRESS, [], CHAIN);
+
+    expect(result.found).toBe(false);
+    expect(db._signals).toHaveLength(0);
+  });
+
+  it('is idempotent — skips if signal already exists', async () => {
+    const existingSignal: Signal = {
+      id: 'sig-existing',
+      walletId: WALLET_ID,
+      chain: CHAIN,
+      funderAddress: '0xfunder-old',
+      txHash: '0xtxhash-old',
+      blockNumber: 10n,
+      blockTimestamp: new Date(),
+      source: 'computed',
+      confidence: '0.9',
+    };
+    const walletRow: WalletRow = {
+      id: WALLET_ID,
+      address: WALLET_ADDRESS,
+      lastScannedAt: null,
+      lastScannedBlock: null,
+    };
+    const db = makeMockDb([existingSignal], [walletRow]);
+
+    const txs: import('../../chains/transactionFetcher.js').RawTransaction[] = [
+      {
+        txHash: '0xtxhash-new',
+        fromAddress: '0xnewfunder',
+        toAddress: WALLET_ADDRESS.toLowerCase(),
+        blockNumber: 200n,
+        blockTimestamp: new Date(),
+        valueWei: '1000000000000000000',
+        isInbound: true,
+        chain: CHAIN,
+      },
+    ];
+
+    const scanner = new FirstFunderScanner(() => db as never);
+    const result = await scanner.extractFromTransactions(WALLET_ID, WALLET_ADDRESS, txs, CHAIN);
+
+    expect(result.skipped).toBe(true);
+    expect(db._signals).toHaveLength(1); // no new signal
+  });
+
+  it('sets confidence=1.0 and source=etherscan_verified when Etherscan confirms funder', async () => {
+    const walletRow: WalletRow = {
+      id: WALLET_ID,
+      address: WALLET_ADDRESS,
+      lastScannedAt: null,
+      lastScannedBlock: null,
+    };
+    const db = makeMockDb([], [walletRow]);
+
+    // Must be a full 40-char hex address to match the Etherscan HTML regex
+    const funder = '0xabcdef1234567890abcdef1234567890abcdef12';
+
+    // Mock Etherscan HTML response with matching "Funded by" link
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () =>
+        `<html>Funded by <a href="/address/${funder}">Short Tag</a></html>`,
+    }));
+
+    const txs: import('../../chains/transactionFetcher.js').RawTransaction[] = [
+      {
+        txHash: '0xtxhash-verified',
+        fromAddress: funder,
+        toAddress: WALLET_ADDRESS.toLowerCase(),
+        blockNumber: 100n,
+        blockTimestamp: new Date(),
+        valueWei: '1000000000000000000',
+        isInbound: true,
+        chain: CHAIN,
+      },
+    ];
+
+    const scanner = new FirstFunderScanner(() => db as never);
+    const result = await scanner.extractFromTransactions(WALLET_ID, WALLET_ADDRESS, txs, CHAIN);
+
+    expect(result.found).toBe(true);
+    expect(db._signals[0]!.confidence).toBe('1.00');
+    expect(db._signals[0]!.source).toBe('etherscan_verified');
+  });
+
+  it('sets confidence=0.7 and source=etherscan_conflict on funder mismatch', async () => {
+    const walletRow: WalletRow = {
+      id: WALLET_ID,
+      address: WALLET_ADDRESS,
+      lastScannedAt: null,
+      lastScannedBlock: null,
+    };
+    const db = makeMockDb([], [walletRow]);
+
+    // Both must be full 40-char hex to satisfy the regex + comparison
+    const computedFunder = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const etherscanFunder = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () =>
+        `<html>Funded by <a href="/address/${etherscanFunder}">Short</a></html>`,
+    }));
+
+    const txs: import('../../chains/transactionFetcher.js').RawTransaction[] = [
+      {
+        txHash: '0xtxhash-conflict',
+        fromAddress: computedFunder,
+        toAddress: WALLET_ADDRESS.toLowerCase(),
+        blockNumber: 100n,
+        blockTimestamp: new Date(),
+        valueWei: '1000000000000000000',
+        isInbound: true,
+        chain: CHAIN,
+      },
+    ];
+
+    const scanner = new FirstFunderScanner(() => db as never);
+    const result = await scanner.extractFromTransactions(WALLET_ID, WALLET_ADDRESS, txs, CHAIN);
+
+    expect(result.found).toBe(true);
+    expect(db._signals[0]!.confidence).toBe('0.70');
+    expect(db._signals[0]!.source).toBe('etherscan_conflict');
+  });
+});
