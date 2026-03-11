@@ -8,13 +8,13 @@ import { env } from '../config/env.js';
 export interface RawTransaction {
   txHash: string;
   fromAddress: string; // lowercase
-  toAddress: string; // lowercase, '' for contract creation
+  toAddress: string;   // lowercase, '' for contract creation
   blockNumber: bigint;
   blockTimestamp: Date;
-  valueWei: string; // native token value as string
-  isInbound: boolean; // relative to the scanned wallet address
+  valueWei: string;    // native token value as string
+  isInbound: boolean;  // relative to the scanned wallet address
   chain: ChainSlug;
-  // ERC20 transfer fields (undefined for native txs)
+  // ERC20 fields (undefined for native txs)
   tokenSymbol?: string;
   tokenContractAddress?: string;
   tokenValueRaw?: string;
@@ -23,15 +23,22 @@ export interface RawTransaction {
 export interface FetchResult {
   transactions: RawTransaction[];
   totalFetched: number;
+  /**
+   * true when the wallet has more txs than the scan window covers.
+   * The fetcher grabbed first SCAN_WINDOW_FIRST + last SCAN_WINDOW_LAST txs
+   * but skipped the middle. Queue a deep_scan job to fill the gap overnight.
+   */
+  partial: boolean;
   chain: ChainSlug;
   address: string;
-  partial: boolean;     // true if SCAN_MAX_PAGES cap was hit — scan is incomplete
   fromBlock?: bigint;
   toBlock?: bigint;
 }
 
 export interface FetchOptions {
   fromBlock?: bigint;
+  /** If true, fetch ALL transactions (ignores window limits). Used by deep_scan jobs. */
+  deepScan?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -40,10 +47,10 @@ export interface FetchOptions {
 
 const BLOCKSCOUT_CONFIGS: Record<string, { baseUrl: string }> = {
   ethereum: { baseUrl: 'https://eth.blockscout.com/api/v2' },
-  base: { baseUrl: 'https://base.blockscout.com/api/v2' },
+  base:     { baseUrl: 'https://base.blockscout.com/api/v2' },
   arbitrum: { baseUrl: 'https://arbitrum.blockscout.com/api/v2' },
   optimism: { baseUrl: 'https://optimism.blockscout.com/api/v2' },
-  polygon: { baseUrl: 'https://polygon.blockscout.com/api/v2' },
+  polygon:  { baseUrl: 'https://polygon.blockscout.com/api/v2' },
 };
 
 const ETHERSCAN_CONFIGS: Record<string, { baseUrl: string; envKey: string }> = {
@@ -77,8 +84,18 @@ async function fetchWithRetry(url: string, retries = 3, backoffMs = 1000): Promi
   throw lastErr;
 }
 
+function deduplicateTxs(txs: RawTransaction[]): RawTransaction[] {
+  const seen = new Set<string>();
+  return txs.filter((tx) => {
+    const key = `${tx.txHash}:${tx.tokenContractAddress ?? 'native'}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 // ---------------------------------------------------------------------------
-// Blockscout v2 fetcher
+// Blockscout v2 types
 // ---------------------------------------------------------------------------
 
 interface BlockscoutTx {
@@ -100,132 +117,199 @@ interface BlockscoutTokenTransfer {
   token?: { symbol: string; address: string };
 }
 
-interface BlockscoutTxResponse {
-  items: BlockscoutTx[];
+interface BlockscoutPageResponse<T> {
+  items: T[];
   next_page_params?: Record<string, unknown> | null;
 }
 
-interface BlockscoutTokenResponse {
-  items: BlockscoutTokenTransfer[];
-  next_page_params?: Record<string, unknown> | null;
+// ---------------------------------------------------------------------------
+// Blockscout v2 normalisers
+// ---------------------------------------------------------------------------
+
+function normaliseTx(tx: BlockscoutTx, addr: string, chain: ChainSlug): RawTransaction {
+  const from = tx.from?.hash?.toLowerCase() ?? '';
+  const to   = tx.to?.hash?.toLowerCase()   ?? '';
+  return {
+    txHash: tx.hash,
+    fromAddress: from,
+    toAddress: to,
+    blockNumber: BigInt(tx.block_number ?? 0),
+    blockTimestamp: new Date(tx.timestamp),
+    valueWei: tx.value ?? '0',
+    isInbound: to === addr,
+    chain,
+  };
 }
 
-async function fetchBlockscoutAllTxs(
+function normaliseTokenTransfer(tx: BlockscoutTokenTransfer, addr: string, chain: ChainSlug): RawTransaction {
+  const from = tx.from?.hash?.toLowerCase() ?? '';
+  const to   = tx.to?.hash?.toLowerCase()   ?? '';
+  return {
+    txHash: tx.transaction_hash,
+    fromAddress: from,
+    toAddress: to,
+    blockNumber: BigInt(tx.block_number ?? 0),
+    blockTimestamp: new Date(tx.timestamp),
+    valueWei: '0',
+    isInbound: to === addr,
+    chain,
+    ...(tx.token?.symbol  ? { tokenSymbol: tx.token.symbol } : {}),
+    ...(tx.token?.address ? { tokenContractAddress: tx.token.address.toLowerCase() } : {}),
+    ...(tx.total?.value   ? { tokenValueRaw: tx.total.value } : {}),
+  };
+}
+
+async function fetchBlockscoutPage<T>(url: string): Promise<{ items: T[]; nextUrl: string | null }> {
+  const resp = await fetchWithRetry(url, 3, 1000);
+  const data = (await resp.json()) as BlockscoutPageResponse<T>;
+  const next = data.next_page_params;
+  if (!next || Object.keys(next).length === 0) return { items: data.items ?? [], nextUrl: null };
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(next)) params.set(k, String(v));
+  // Preserve the base URL (before any ?) and append next_page_params
+  const base = url.split('?')[0]!;
+  const existingFixed = url.split('?')[1]
+    ?.split('&')
+    .filter(p => !Object.keys(next).includes(p.split('=')[0] ?? ''))
+    .join('&') ?? '';
+  const nextUrl: string = existingFixed
+    ? `${base}?${existingFixed}&${params.toString()}`
+    : `${base}?${params.toString()}`;
+  return { items: data.items ?? [], nextUrl: nextUrl as string | null };
+}
+
+// ---------------------------------------------------------------------------
+// Blockscout v2 — window fetch (first N asc + last M desc, detect gap)
+// ---------------------------------------------------------------------------
+
+async function fetchBlockscoutWindow(
   baseUrl: string,
   address: string,
   chain: ChainSlug,
-  maxPages: number,
+  firstCount: number,
+  lastCount: number,
+  pageDelayMs: number,
 ): Promise<{ transactions: RawTransaction[]; partial: boolean }> {
   const addr = address.toLowerCase();
-  const PAGE_DELAY = 50;
+
+  async function fetchNPages<T>(
+    startUrl: string,
+    maxItems: number,
+    normalise: (item: T) => RawTransaction,
+  ): Promise<{ results: RawTransaction[]; exhausted: boolean }> {
+    const results: RawTransaction[] = [];
+    let url: string | null = startUrl;
+    while (url && results.length < maxItems) {
+      try {
+        const { items, nextUrl }: { items: T[]; nextUrl: string | null } = await fetchBlockscoutPage<T>(url);
+        results.push(...items.map(normalise));
+        url = nextUrl;
+        if (url) await sleep(pageDelayMs);
+      } catch (err) {
+        console.warn(`[BlockscoutFetcher:${chain}] page fetch failed:`, err);
+        break;
+      }
+    }
+    return { results, exhausted: url === null };
+  }
+
+  const normTx    = (tx: BlockscoutTx)         => normaliseTx(tx, addr, chain);
+  const normToken = (tx: BlockscoutTokenTransfer) => normaliseTokenTransfer(tx, addr, chain);
+
+  // First N ascending
+  const { results: firstNative, exhausted: nativeExhaustedFirst } =
+    await fetchNPages<BlockscoutTx>(
+      `${baseUrl}/addresses/${addr}/transactions?limit=100&sort=asc`,
+      firstCount, normTx,
+    );
+
+  const { results: firstTokens, exhausted: tokensExhaustedFirst } =
+    await fetchNPages<BlockscoutTokenTransfer>(
+      `${baseUrl}/addresses/${addr}/token-transfers?limit=100&type=ERC-20`,
+      firstCount, normToken,
+    );
+
+  // Last M descending (then reverse)
+  const { results: lastNativeRev, exhausted: nativeExhaustedLast } =
+    await fetchNPages<BlockscoutTx>(
+      `${baseUrl}/addresses/${addr}/transactions?limit=100&sort=desc`,
+      lastCount, normTx,
+    );
+  const lastNative = [...lastNativeRev].reverse();
+
+  const { results: lastTokensRev, exhausted: tokensExhaustedLast } =
+    await fetchNPages<BlockscoutTokenTransfer>(
+      `${baseUrl}/addresses/${addr}/token-transfers?limit=100&type=ERC-20&sort=desc`,
+      lastCount, normToken,
+    );
+  const lastTokens = [...lastTokensRev].reverse();
+
+  // Detect gap: latest block in first window < earliest block in last window
+  const allFirst = [...firstNative, ...firstTokens];
+  const allLast  = [...lastNative,  ...lastTokens];
+
+  const firstMaxBlock = allFirst.reduce<bigint | null>((m, tx) => m === null || tx.blockNumber > m ? tx.blockNumber : m, null);
+  const lastMinBlock  = allLast.reduce<bigint | null>((m, tx)  => m === null || tx.blockNumber < m ? tx.blockNumber : m, null);
+
+  const hasGap = firstMaxBlock !== null && lastMinBlock !== null && firstMaxBlock < lastMinBlock - 1n;
+
+  // Also partial if either window was capped (didn't exhaust the chain)
+  const windowCapped = (!nativeExhaustedFirst || !tokensExhaustedFirst) &&
+                       (!nativeExhaustedLast  || !tokensExhaustedLast);
+
+  const partial = hasGap || windowCapped;
+
+  if (partial) {
+    console.info(
+      `[BlockscoutFetcher:${chain}] partial scan for ${addr} — ` +
+      `gap=${hasGap}, capped=${windowCapped}. Queue deep_scan for full coverage.`,
+    );
+  }
+
+  const transactions = deduplicateTxs([...allFirst, ...allLast]);
+  return { transactions, partial };
+}
+
+// ---------------------------------------------------------------------------
+// Blockscout v2 — deep scan (all txs, slow, used overnight)
+// ---------------------------------------------------------------------------
+
+async function fetchBlockscoutAll(
+  baseUrl: string,
+  address: string,
+  chain: ChainSlug,
+  pageDelayMs: number,
+): Promise<{ transactions: RawTransaction[]; partial: false }> {
+  const addr = address.toLowerCase();
   const results: RawTransaction[] = [];
 
-  // ---- Native transactions ----
-  let nativeUrl: string | null =
-    `${baseUrl}/addresses/${addr}/transactions?limit=100&sort=asc`;
-  let nativePages = 0;
-  let nativePartial = false;
-
+  let nativeUrl: string | null = `${baseUrl}/addresses/${addr}/transactions?limit=100&sort=asc`;
   while (nativeUrl) {
-    if (nativePages >= maxPages) {
-      console.warn(`[BlockscoutFetcher:${chain}] native tx page cap (${maxPages}) hit for ${addr} — marking partial`);
-      nativePartial = true;
-      break;
-    }
-    nativePages++;
-    let data: BlockscoutTxResponse;
     try {
-      const resp = await fetchWithRetry(nativeUrl, 3, 1000);
-      data = (await resp.json()) as BlockscoutTxResponse;
+      const { items, nextUrl }: { items: BlockscoutTx[]; nextUrl: string | null } = await fetchBlockscoutPage<BlockscoutTx>(nativeUrl);
+      results.push(...items.map((tx) => normaliseTx(tx, addr, chain)));
+      nativeUrl = nextUrl;
+      if (nativeUrl) await sleep(pageDelayMs);
     } catch (err) {
-      console.warn(`[BlockscoutFetcher:${chain}] native tx page failed:`, err);
+      console.warn(`[BlockscoutFetcher:${chain}] deep scan native page failed:`, err);
       break;
-    }
-
-    for (const tx of data.items ?? []) {
-      if (tx.block_number === null) continue;
-      const fromAddr = tx.from?.hash?.toLowerCase() ?? '';
-      const toAddr = tx.to?.hash?.toLowerCase() ?? '';
-      results.push({
-        txHash: tx.hash,
-        fromAddress: fromAddr,
-        toAddress: toAddr,
-        blockNumber: BigInt(tx.block_number),
-        blockTimestamp: new Date(tx.timestamp),
-        valueWei: tx.value ?? '0',
-        isInbound: toAddr === addr,
-        chain,
-      });
-    }
-
-    const next = data.next_page_params;
-    if (next && Object.keys(next).length > 0) {
-      const params = new URLSearchParams();
-      for (const [k, v] of Object.entries(next)) {
-        params.set(k, String(v));
-      }
-      nativeUrl = `${baseUrl}/addresses/${addr}/transactions?limit=100&sort=asc&${params.toString()}`;
-      await sleep(PAGE_DELAY);
-    } else {
-      nativeUrl = null;
     }
   }
 
-  // ---- ERC-20 transfers ----
-  let tokenUrl: string | null =
-    `${baseUrl}/addresses/${addr}/token-transfers?limit=100&type=ERC-20`;
-  let tokenPages = 0;
-  let tokenPartial = false;
-
+  let tokenUrl: string | null = `${baseUrl}/addresses/${addr}/token-transfers?limit=100&type=ERC-20`;
   while (tokenUrl) {
-    if (tokenPages >= maxPages) {
-      console.warn(`[BlockscoutFetcher:${chain}] ERC-20 page cap (${maxPages}) hit for ${addr} — marking partial`);
-      tokenPartial = true;
-      break;
-    }
-    tokenPages++;
-    let data: BlockscoutTokenResponse;
     try {
-      const resp = await fetchWithRetry(tokenUrl, 3, 1000);
-      data = (await resp.json()) as BlockscoutTokenResponse;
+      const { items, nextUrl }: { items: BlockscoutTokenTransfer[]; nextUrl: string | null } = await fetchBlockscoutPage<BlockscoutTokenTransfer>(tokenUrl);
+      results.push(...items.map((tx) => normaliseTokenTransfer(tx, addr, chain)));
+      tokenUrl = nextUrl;
+      if (tokenUrl) await sleep(pageDelayMs);
     } catch (err) {
-      console.warn(`[BlockscoutFetcher:${chain}] token transfer page failed:`, err);
+      console.warn(`[BlockscoutFetcher:${chain}] deep scan token page failed:`, err);
       break;
-    }
-
-    for (const tx of data.items ?? []) {
-      if (tx.block_number === null) continue;
-      const fromAddr = tx.from?.hash?.toLowerCase() ?? '';
-      const toAddr = tx.to?.hash?.toLowerCase() ?? '';
-      results.push({
-        txHash: tx.transaction_hash,
-        fromAddress: fromAddr,
-        toAddress: toAddr,
-        blockNumber: BigInt(tx.block_number),
-        blockTimestamp: new Date(tx.timestamp),
-        valueWei: '0',
-        isInbound: toAddr === addr,
-        chain,
-        ...(tx.token?.symbol !== undefined ? { tokenSymbol: tx.token.symbol } : {}),
-        ...(tx.token?.address !== undefined ? { tokenContractAddress: tx.token.address.toLowerCase() } : {}),
-        ...(tx.total?.value !== undefined ? { tokenValueRaw: tx.total.value } : {}),
-      });
-    }
-
-    const next = data.next_page_params;
-    if (next && Object.keys(next).length > 0) {
-      const params = new URLSearchParams();
-      for (const [k, v] of Object.entries(next)) {
-        params.set(k, String(v));
-      }
-      tokenUrl = `${baseUrl}/addresses/${addr}/token-transfers?limit=100&type=ERC-20&${params.toString()}`;
-      await sleep(PAGE_DELAY);
-    } else {
-      tokenUrl = null;
     }
   }
 
-  return { transactions: results, partial: nativePartial || tokenPartial };
+  return { transactions: deduplicateTxs(results), partial: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -283,23 +367,20 @@ async function fetchEtherscanAllTxs(
     return `${baseUrl}?${params.toString()}`;
   };
 
-  // Native txs
   try {
     const resp = await fetchWithRetry(buildUrl('txlist'), 3, 1000);
     const data = (await resp.json()) as EtherscanResponse<EtherscanTx>;
     if (data.status === '1' && Array.isArray(data.result)) {
       for (const tx of data.result) {
         if (tx.isError !== '0') continue;
-        const fromAddr = tx.from.toLowerCase();
-        const toAddr = tx.to.toLowerCase();
         results.push({
           txHash: tx.hash,
-          fromAddress: fromAddr,
-          toAddress: toAddr,
+          fromAddress: tx.from.toLowerCase(),
+          toAddress: tx.to.toLowerCase(),
           blockNumber: BigInt(tx.blockNumber),
           blockTimestamp: new Date(Number(tx.timeStamp) * 1000),
           valueWei: tx.value,
-          isInbound: toAddr === addr,
+          isInbound: tx.to.toLowerCase() === addr,
           chain,
         });
       }
@@ -308,22 +389,19 @@ async function fetchEtherscanAllTxs(
     console.warn(`[EtherscanFetcher:${chain}] native tx fetch failed:`, err);
   }
 
-  // ERC-20 transfers
   try {
     const resp = await fetchWithRetry(buildUrl('tokentx'), 3, 1000);
     const data = (await resp.json()) as EtherscanResponse<EtherscanTokenTx>;
     if (data.status === '1' && Array.isArray(data.result)) {
       for (const tx of data.result) {
-        const fromAddr = tx.from.toLowerCase();
-        const toAddr = tx.to.toLowerCase();
         results.push({
           txHash: tx.hash,
-          fromAddress: fromAddr,
-          toAddress: toAddr,
+          fromAddress: tx.from.toLowerCase(),
+          toAddress: tx.to.toLowerCase(),
           blockNumber: BigInt(tx.blockNumber),
           blockTimestamp: new Date(Number(tx.timeStamp) * 1000),
           valueWei: '0',
-          isInbound: toAddr === addr,
+          isInbound: tx.to.toLowerCase() === addr,
           chain,
           ...(tx.tokenSymbol ? { tokenSymbol: tx.tokenSymbol } : {}),
           tokenContractAddress: tx.contractAddress.toLowerCase(),
@@ -335,9 +413,9 @@ async function fetchEtherscanAllTxs(
     console.warn(`[EtherscanFetcher:${chain}] token tx fetch failed:`, err);
   }
 
-  // Etherscan/Snowtrace uses offset=10000 which caps at 10k txs — not truly unbounded
-  // but mark partial if exactly 10000 results returned (hit the limit)
-  return { transactions: results, partial: results.length >= 10000 };
+  // Snowtrace caps at 10k via offset; mark partial if we hit that limit
+  const deduped = deduplicateTxs(results);
+  return { transactions: deduped, partial: deduped.length >= 10000 };
 }
 
 // ---------------------------------------------------------------------------
@@ -352,57 +430,52 @@ export class WalletTransactionFetcher {
   }
 
   /**
-   * Fetch ALL transactions for a wallet (native + ERC20, paginated).
+   * Fetch transactions using the first+last window strategy:
+   *   - First SCAN_WINDOW_FIRST txs (asc) — early funding/sybil signals
+   *   - Last SCAN_WINDOW_LAST txs (desc reversed) — recent deposit/P2P activity
+   *   - Gap detection: if uncovered history exists, partial=true
+   *
+   * opts.deepScan=true: fetch ALL txs with DEEP_SCAN_PAGE_DELAY_MS between pages.
+   * Only used by overnight deep_scan jobs for flagged partial wallets.
    */
   async fetchAll(address: string, opts?: FetchOptions): Promise<FetchResult> {
     const addr = address.toLowerCase();
-    let transactions: RawTransaction[];
-    let isPartial = false;
+    let fetchResult: { transactions: RawTransaction[]; partial: boolean };
 
     if (this.chain in BLOCKSCOUT_CONFIGS) {
-      const config = BLOCKSCOUT_CONFIGS[this.chain]!;
-      const result = await fetchBlockscoutAllTxs(config.baseUrl, addr, this.chain, env.SCAN_MAX_PAGES);
-      transactions = result.transactions;
-      isPartial = result.partial;
+      const { baseUrl } = BLOCKSCOUT_CONFIGS[this.chain]!;
+      if (opts?.deepScan) {
+        fetchResult = await fetchBlockscoutAll(baseUrl, addr, this.chain, env.DEEP_SCAN_PAGE_DELAY_MS);
+      } else {
+        fetchResult = await fetchBlockscoutWindow(
+          baseUrl, addr, this.chain,
+          env.SCAN_WINDOW_FIRST,
+          env.SCAN_WINDOW_LAST,
+          50,
+        );
+      }
     } else if (this.chain in ETHERSCAN_CONFIGS) {
       const config = ETHERSCAN_CONFIGS[this.chain]!;
       const apiKey = env[config.envKey as keyof typeof env] as string | undefined;
-      const result = await fetchEtherscanAllTxs(config.baseUrl, addr, this.chain, apiKey);
-      transactions = result.transactions;
-      isPartial = result.partial;
+      // Etherscan 10k cap is generous; deep_scan flag not needed for Avalanche
+      fetchResult = await fetchEtherscanAllTxs(config.baseUrl, addr, this.chain, apiKey);
     } else {
       throw new Error(`WalletTransactionFetcher: unsupported chain "${this.chain}"`);
     }
 
-    // Deduplicate by txHash + token contract (a tx can appear in both native and token endpoints)
-    const seen = new Set<string>();
-    const deduped: RawTransaction[] = [];
-    for (const tx of transactions) {
-      const key = `${tx.txHash}:${tx.tokenContractAddress ?? 'native'}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        deduped.push(tx);
-      }
-    }
-
-    const blockNumbers = deduped.map((t) => t.blockNumber);
-    const fromBlock =
-      blockNumbers.length > 0 ? blockNumbers.reduce((a, b) => (a < b ? a : b)) : undefined;
-    const toBlock =
-      blockNumbers.length > 0 ? blockNumbers.reduce((a, b) => (a > b ? a : b)) : undefined;
-
-    // Satisfy opts usage (fromBlock for delta scans — currently not used in fetch logic
-    // but accepted for forward-compatibility with M5)
-    void opts;
+    const { transactions, partial } = fetchResult;
+    const blockNumbers = transactions.map((t) => t.blockNumber);
+    const fromBlock = blockNumbers.length > 0 ? blockNumbers.reduce((a, b) => (a < b ? a : b)) : undefined;
+    const toBlock   = blockNumbers.length > 0 ? blockNumbers.reduce((a, b) => (a > b ? a : b)) : undefined;
 
     return {
-      transactions: deduped,
-      totalFetched: deduped.length,
-      partial: isPartial,
+      transactions,
+      totalFetched: transactions.length,
+      partial,
       chain: this.chain,
       address: addr,
       ...(fromBlock !== undefined ? { fromBlock } : {}),
-      ...(toBlock !== undefined ? { toBlock } : {}),
+      ...(toBlock   !== undefined ? { toBlock   } : {}),
     };
   }
 }

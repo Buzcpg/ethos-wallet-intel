@@ -12,6 +12,11 @@ import { env } from '../config/env.js';
 // Types
 // ---------------------------------------------------------------------------
 
+export interface WalletScanOptions {
+  /** If true, fetch ALL transactions (overrides window strategy). Used by deep_scan jobs. */
+  deepScan?: boolean;
+}
+
 export interface WalletScanResult {
   walletId: string;
   chain: ChainSlug;
@@ -19,6 +24,8 @@ export interface WalletScanResult {
   firstFunderFound: boolean;
   depositEvidenceFound: number;
   p2pMatchesFound: number;
+  /** true if scan used first+last window and a gap exists — queue deep_scan to fill it */
+  partial: boolean;
   durationMs: number;
   error?: string;
 }
@@ -56,7 +63,7 @@ export class WalletScanner {
   /**
    * Full scan: fetch all transactions once, run all three extractors in parallel.
    */
-  async scanWallet(walletId: string, chain: ChainSlug): Promise<WalletScanResult> {
+  async scanWallet(walletId: string, chain: ChainSlug, opts?: WalletScanOptions): Promise<WalletScanResult> {
     const startMs = Date.now();
     const database = this.getDbFn();
 
@@ -76,7 +83,8 @@ export class WalletScanner {
           firstFunderFound: false,
           depositEvidenceFound: 0,
           p2pMatchesFound: 0,
-          durationMs: Date.now() - startMs,
+          partial: false,
+      durationMs: Date.now() - startMs,
           error: `Wallet ${walletId} not found`,
         };
       }
@@ -106,7 +114,8 @@ export class WalletScanner {
           firstFunderFound: true,
           depositEvidenceFound: 0,
           p2pMatchesFound: 0,
-          durationMs: Date.now() - startMs,
+          partial: false,
+      durationMs: Date.now() - startMs,
         };
       }
 
@@ -154,6 +163,7 @@ export class WalletScanner {
         walletId,
         chain,
         transactionsFetched: fetchResult.totalFetched,
+      partial: fetchResult.partial,
         firstFunderFound: firstFunderResult.found,
         depositEvidenceFound: depositResult.depositsFound,
         p2pMatchesFound: p2pResult.matchesFound,
@@ -170,7 +180,8 @@ export class WalletScanner {
         firstFunderFound: false,
         depositEvidenceFound: 0,
         p2pMatchesFound: 0,
-        durationMs: Date.now() - startMs,
+        partial: false,
+      durationMs: Date.now() - startMs,
         error: message,
       };
     }

@@ -1,4 +1,6 @@
 import type { JobHandler, JobType } from './types.js';
+import type { ChainSlug } from '../chains/index.js';
+import { db } from '../db/client.js';
 import { WalletScanner } from '../scanner/walletScanner.js';
 import { FirstFunderScanner } from '../scanner/firstFunderScanner.js';
 import { FirstFunderMatcher } from '../matcher/firstFunderMatcher.js';
@@ -88,4 +90,18 @@ export const jobRegistry: Record<JobType, JobHandler> = {
   delta: deltaHandler,
   new_user: newUserHandler,
   manual: manualHandler,
+  /**
+   * deep_scan — fetches ALL transactions for a partial wallet (no window limit).
+   * Runs with DEEP_SCAN_PAGE_DELAY_MS between pages to stay within rate limits.
+   * Only queued for wallets where a previous scan returned partial=true.
+   */
+  deep_scan: async (job) => {
+    if (!job.walletId || !job.chain) {
+      console.warn('[deep_scan] invalid job, skipping');
+      return;
+    }
+    console.log(`[deep_scan] full tx history — wallet ${job.walletId} on ${job.chain}`);
+    const scanner = new WalletScanner(db);
+    await scanner.scanWallet(job.walletId, job.chain as ChainSlug, { deepScan: true });
+  },
 };
