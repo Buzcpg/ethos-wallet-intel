@@ -1,0 +1,62 @@
+version: '3.9'
+
+# ethos-wallet-intel — Postgres only.
+# Binds exclusively to 127.0.0.1 — no external exposure.
+# Service connects via localhost:5432.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ethos-intel-pg
+    restart: unless-stopped
+
+    # Security: bind ONLY to loopback. Never 0.0.0.0.
+    ports:
+      - "127.0.0.1:5433:5432"
+
+    environment:
+      POSTGRES_DB: ethos_wallet_intel
+      POSTGRES_USER: ethos_intel
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+
+    secrets:
+      - pg_password
+
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c hba_file=/etc/postgresql/pg_hba.conf
+
+    # Resource limits: cap at 512MB RAM, 1.5 CPUs
+    mem_limit: 512m
+    cpus: '1.5'
+
+    # Health check — service won't start until PG is ready
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ethos_intel -d ethos_wallet_intel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    # Isolated network — no bridge to other containers unless explicitly joined
+    networks:
+      - ethos_intel_internal
+
+secrets:
+  pg_password:
+    file: ./postgres/pg_password.secret
+
+volumes:
+  pg_data:
+    driver: local
+
+networks:
+  ethos_intel_internal:
+    driver: bridge
+    internal: true   # No external routing from this network
