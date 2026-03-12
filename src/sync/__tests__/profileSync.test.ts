@@ -61,7 +61,7 @@ interface InsertedWallet {
 }
 
 interface InsertedProfile {
-  externalProfileId: string;
+  externalProfileId: number;
   displayName: string;
   slug: string | null | undefined;
   status: string;
@@ -81,17 +81,14 @@ function makeMockDb(opts?: { existingWallets?: boolean }) {
       const name = tableName(table);
 
       return {
-        values: (vals: Record<string, unknown>) => ({
-          onConflictDoUpdate: (_opts: unknown) => ({
-            returning: (_cols: unknown) => {
-              if (name === 'wallets') {
-                insertedWallets.push(vals as unknown as InsertedWallet);
-                // Simulate new row (xmax='0') or existing row (xmax='1')
-                return Promise.resolve([
-                  { id: vals['id'] as string, xmax: existingWallets ? '1' : '0' },
-                ]);
-              } else if (name === 'profiles') {
-                const p = vals as unknown as InsertedProfile;
+        values: (vals: Record<string, unknown> | Record<string, unknown>[]) => {
+          const valsArray = Array.isArray(vals) ? vals : [vals];
+
+          const onConflictDoUpdate = (_opts: unknown) => {
+            // Side effect for profiles: push now (profiles upsert doesn't call .returning())
+            if (name === 'profiles') {
+              for (const v of valsArray) {
+                const p = v as unknown as InsertedProfile;
                 const idx = insertedProfiles.findIndex(
                   (x) => x.externalProfileId === p.externalProfileId,
                 );
@@ -100,12 +97,33 @@ function makeMockDb(opts?: { existingWallets?: boolean }) {
                 } else {
                   insertedProfiles.push(p);
                 }
-                return Promise.resolve([{ id: 'mock-profile-id', xmax: '0' }]);
               }
-              return Promise.resolve([]);
-            },
-          }),
-        }),
+            }
+
+            // Return a Promise (for upsertProfiles which awaits without .returning())
+            // plus a .returning() method (for upsertWallets which chains .returning())
+            const base = Promise.resolve([] as unknown[]);
+            return Object.assign(base, {
+              returning: (_cols: unknown): Promise<unknown[]> => {
+                if (name === 'wallets') {
+                  for (const v of valsArray) {
+                    insertedWallets.push(v as unknown as InsertedWallet);
+                  }
+                  return Promise.resolve(
+                    valsArray.map((v) => ({
+                      id: v['id'] as string,
+                      chain: v['chain'] as string,
+                      xmax: existingWallets ? '1' : '0',
+                    })),
+                  );
+                }
+                return Promise.resolve([]);
+              },
+            });
+          };
+
+          return { onConflictDoUpdate };
+        },
       };
     },
 

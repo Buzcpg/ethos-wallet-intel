@@ -42,21 +42,25 @@ function makeMockDb(storedEvidence: EvidenceRow[] = []) {
   const db = {
     _evidence: evidence,
 
+    // Returns all stored evidence directly from .where() — no .limit() needed
     select: (_fields: unknown) => ({
       from: (_table: unknown) => ({
-        where: (_cond: unknown) => ({
-          limit: (_n: number) =>
-            Promise.resolve(evidence.length > 0 ? [evidence[evidence.length - 1]] : []),
-        }),
+        where: (_cond: unknown) => Promise.resolve([...evidence]),
       }),
     }),
 
     insert: (_table: unknown) => ({
-      values: (vals: Record<string, unknown>) => ({
+      values: (vals: unknown) => ({
         returning: (_fields: unknown) => {
-          const id = `evi-${nextId++}`;
-          evidence.push({ id, ...(vals as Omit<EvidenceRow, 'id'>) } as EvidenceRow);
-          return Promise.resolve([{ id }]);
+          const valsArray = Array.isArray(vals)
+            ? (vals as Record<string, unknown>[])
+            : [vals as Record<string, unknown>];
+          const inserted = valsArray.map((v) => {
+            const id = `evi-${nextId++}`;
+            evidence.push({ id, ...(v as Omit<EvidenceRow, 'id'>) } as EvidenceRow);
+            return { id, txHash: v['txHash'] as string };
+          });
+          return Promise.resolve(inserted);
         },
       }),
     }),
@@ -114,9 +118,7 @@ describe('DepositScanner', () => {
     // Override DB select to return empty (no existing evidence)
     db.select = (_: unknown) => ({
       from: (_t: unknown) => ({
-        where: (_c: unknown) => ({
-          limit: (_n: number) => Promise.resolve([]),
-        }),
+        where: (_c: unknown) => Promise.resolve([]),
       }),
     });
 
@@ -195,9 +197,7 @@ describe('DepositScanner', () => {
     });
     db.select = (_: unknown) => ({
       from: (_t: unknown) => ({
-        where: (_c: unknown) => ({
-          limit: (_n: number) => Promise.resolve([]),
-        }),
+        where: (_c: unknown) => Promise.resolve([]),
       }),
     });
 
