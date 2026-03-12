@@ -169,6 +169,6 @@ export class WalletDriftChecker {
       throw new Error(`Supabase fetch failed: ${res.status} ${res.statusText}`);
     }
 
-    return res.json() as Promise<SupabaseProfileRow[]>;
+    return (await res.json()) as SupabaseProfileRow[];
   }
 }

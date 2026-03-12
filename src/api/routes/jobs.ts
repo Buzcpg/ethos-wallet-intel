@@ -16,8 +16,15 @@ const scanWalletSchema = z.object({
   type: z.enum(['manual', 'delta', 'new_user', 'backfill']).default('manual'),
 });
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 jobs.get('/:id', async (c) => {
   const id = c.req.param('id');
+
+  if (!UUID_RE.test(id)) {
+    return c.json({ error: 'Invalid job ID — must be a UUID' }, 400);
+  }
+
   const job = await getJob(id);
 
   if (!job) {
