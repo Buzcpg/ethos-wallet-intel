@@ -159,3 +159,10 @@ export async function getQueueCounts(): Promise<{
 
   return counts;
 }
+
+export async function getJob(jobId: string): Promise<WalletScanJob | null> {
+  const result = await getDb().query.walletScanJobs.findFirst({
+    where: eq(walletScanJobs.id, jobId),
+  });
+  return result ?? null;
+}
