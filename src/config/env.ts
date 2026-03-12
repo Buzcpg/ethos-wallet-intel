@@ -19,8 +19,10 @@ const envSchema = z.object({
   ETHERSCAN_API_KEY: z.string().optional(),
   POLYGONSCAN_API_KEY: z.string().optional(),
   SNOWTRACE_API_KEY: z.string().optional(),
-  // Blockscout Pro API key (api.blockscout.com multichain — activate if plan upgrades from free tier)
-  BLOCKSCOUT_PRO_API_KEY: z.string().optional(),
+  // Comma-separated Blockscout per-instance API keys for round-robin rotation.
+  // Each key has its own 600/min budget — N keys = N× throughput per chain.
+  // Create keys at each chain's Blockscout instance → My Account → API Keys
+  BLOCKSCOUT_API_KEYS: z.string().optional(),
   // Comma-separated chain slugs to skip in dequeue (e.g. 'avalanche' during peak hours)
   SKIP_CHAINS: z.string().optional(),
   // Supabase — profile ID enumeration (faster than Ethos API pagination)

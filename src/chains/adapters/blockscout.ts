@@ -1,9 +1,7 @@
 import type { ChainAdapter, FirstInboundTx } from '../adapter.js';
 import type { ChainSlug } from '../index.js';
+import { env } from '../../config/env.js';
 
-// Blockscout v2 REST API instances.
-// Use Blockscout for all chains where an official instance exists — free, generous limits, no key needed.
-// Avalanche: no confirmed Blockscout v2 instance for C-chain; handled by EtherscanAdapter (Snowtrace).
 const BLOCKSCOUT_CONFIGS: Record<string, { baseUrl: string }> = {
   ethereum: { baseUrl: 'https://eth.blockscout.com/api/v2' },
   base:     { baseUrl: 'https://base.blockscout.com/api/v2' },
@@ -25,8 +23,43 @@ interface BlockscoutResponse {
   next_page_params?: unknown;
 }
 
+// Round-robin key rotator — distributes requests across all configured keys.
+// Each key has its own per-account rate limit bucket, so N keys ≈ N× throughput.
+class KeyRotator {
+  private keys: string[];
+  private idx = 0;
+
+  constructor(keys: string[]) {
+    this.keys = keys.filter(Boolean);
+  }
+
+  next(): string | undefined {
+    if (this.keys.length === 0) return undefined;
+    const key = this.keys[this.idx % this.keys.length];
+    this.idx++;
+    return key;
+  }
+
+  count(): number { return this.keys.length; }
+}
+
+// Shared rotator — single instance across all BlockscoutAdapter instances so
+// rotation is global (not per-chain-adapter). Reads keys at module load time.
+function buildRotator(): KeyRotator {
+  const raw = env.BLOCKSCOUT_API_KEYS ?? '';
+  const keys = raw.split(',').map(k => k.trim()).filter(Boolean);
+  if (keys.length === 0) {
+    console.warn('[BlockscoutAdapter] no API keys configured — running at IP rate limit');
+  } else {
+    console.log(`[BlockscoutAdapter] key rotation: ${keys.length} key(s) configured`);
+  }
+  return new KeyRotator(keys);
+}
+
+const rotator = buildRotator();
+
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function fetchWithRetry(url: string, retries = 3, backoffMs = 1000): Promise<Response> {
@@ -36,7 +69,6 @@ async function fetchWithRetry(url: string, retries = 3, backoffMs = 1000): Promi
       const response = await fetch(url);
       if (response.ok) return response;
       if (response.status === 429) {
-        // Rate limited — back off
         await sleep(backoffMs * (attempt + 1));
         continue;
       }
@@ -51,21 +83,29 @@ async function fetchWithRetry(url: string, retries = 3, backoffMs = 1000): Promi
 
 export class BlockscoutAdapter implements ChainAdapter {
   readonly chain: ChainSlug;
-  private baseUrl: string;
+  private readonly baseUrl: string;
 
   constructor(chain: ChainSlug) {
     const config = BLOCKSCOUT_CONFIGS[chain];
-    if (!config) {
-      throw new Error(`BlockscoutAdapter: no config for chain "${chain}"`);
-    }
+    if (!config) throw new Error(`BlockscoutAdapter: no config for chain "${chain}"`);
     this.chain = chain;
     this.baseUrl = config.baseUrl;
   }
 
+  private buildUrl(addr: string, path: string, extra: Record<string, string> = {}): string {
+    const params = new URLSearchParams({ ...extra });
+    const key = rotator.next();
+    if (key) params.set('apikey', key);
+    return `${this.baseUrl}/${path}?${params.toString()}`;
+  }
+
   async getFirstInboundNativeTx(address: string): Promise<FirstInboundTx | null> {
     const addr = address.toLowerCase();
-    // Filter=to returns txs where this address is the recipient; limit=10, sort=asc gets earliest first
-    const url = `${this.baseUrl}/addresses/${addr}/transactions?filter=to&limit=10&sort=asc`;
+    const url = this.buildUrl(addr, `addresses/${addr}/transactions`, {
+      filter: 'to',
+      limit: '10',
+      sort: 'asc',
+    });
 
     let data: BlockscoutResponse;
     try {
@@ -78,8 +118,7 @@ export class BlockscoutAdapter implements ChainAdapter {
 
     if (!data?.items?.length) return null;
 
-    // Find first tx with non-zero native value
-    const tx = data.items.find((t) => t.value && BigInt(t.value) > 0n);
+    const tx = data.items.find(t => t.value && BigInt(t.value) > 0n);
     if (!tx) return null;
 
     return {
