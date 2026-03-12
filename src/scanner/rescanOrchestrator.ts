@@ -6,7 +6,7 @@ import { env } from '../config/env.js';
 import { enqueueJob } from '../queue/index.js';
 import { ProfileSyncService } from '../sync/profileSync.js';
 import { SupabaseSync, type SupabaseProfileRow } from '../sync/supabaseSync.js';
-import { EthosApiClient } from '../ethos/client.js';
+import { EthosApiClient, createLimiter } from '../ethos/client.js';
 import { sql } from 'drizzle-orm';
 import { profiles } from '../db/schema/index.js';
 
@@ -118,19 +118,6 @@ export class RescanOrchestrator {
     let newWallets = 0;
     let highestIdProbed = highestSeen;
 
-    // Concurrency limiter (reuse Ethos API rate limit pattern)
-    function createLimiter(max: number) {
-      let running = 0;
-      const queue: Array<{ fn: () => Promise<unknown>; resolve: (v: unknown) => void; reject: (e: unknown) => void }> = [];
-      const next = () => {
-        if (!queue.length || running >= max) return;
-        running++;
-        const { fn, resolve, reject } = queue.shift()!;
-        fn().then(resolve, reject).finally(() => { running--; next(); });
-      };
-      return <T>(fn: () => Promise<T>): Promise<T> =>
-        new Promise((resolve, reject) => { queue.push({ fn, resolve: resolve as (v: unknown) => void, reject }); next(); });
-    }
     const limit = createLimiter(concurrency);
 
     while (consecutiveMisses < maxMisses) {
@@ -159,9 +146,9 @@ export class RescanOrchestrator {
         batchHadHit = true;
 
         try {
-          await this.profileSync.syncProfile(id);
+          const syncResult = await this.profileSync.syncProfile(id);
           newProfiles++;
-          newWallets += data.allAddresses.length * CHAIN_SLUGS.length;
+          newWallets += syncResult.walletsUpserted; // actual new rows, not estimated
         } catch (err) {
           console.warn(`[RescanOrchestrator] syncNewProfiles: failed to sync profile ${id}:`, err);
         }
