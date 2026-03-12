@@ -31,6 +31,8 @@ const envSchema = z.object({
   // Delta rescan settings
   // Number of hours between rescans; wallets scanned within this window are skipped
   RESCAN_INTERVAL_HOURS: z.coerce.number().int().positive().default(24),
+  // Max consecutive 404s before stopping new profile ID probe (IDs have gaps)
+  NEW_USER_PROBE_MAX_MISSES: z.coerce.number().int().positive().default(200),
   // Max pages to fetch in a delta scan (only new transactions since last_scanned_block)
   SCAN_MAX_PAGES_DELTA: z.coerce.number().int().positive().default(10),
 });

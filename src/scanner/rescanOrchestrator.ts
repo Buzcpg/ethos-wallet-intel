@@ -5,6 +5,9 @@ import { WalletScanner } from './walletScanner.js';
 import { env } from '../config/env.js';
 import { enqueueJob } from '../queue/index.js';
 import { ProfileSyncService } from '../sync/profileSync.js';
+import { EthosApiClient } from '../ethos/client.js';
+import { sql } from 'drizzle-orm';
+import { profiles } from '../db/schema/index.js';
 
 // ---------------------------------------------------------------------------
 // RescanOrchestrator
@@ -76,29 +79,105 @@ export class RescanOrchestrator {
    *
    * Returns counts of new profiles, new wallets, and jobs enqueued.
    */
+  /**
+   * Forward-probe for new Ethos profiles since our last known profile ID.
+   *
+   * Strategy:
+   * 1. Get highest external_profile_id from our profiles table
+   * 2. Probe IDs from (highestSeen + 1) upward in concurrent batches
+   * 3. Stop after NEW_USER_PROBE_MAX_MISSES consecutive misses (IDs have gaps)
+   * 4. For each found profile: upsert profile + wallets → new_user job auto-enqueued
+   *
+   * Designed to run every 30 minutes. Fast and cheap — only hits the delta.
+   */
   async syncNewProfiles(): Promise<{
     newProfiles: number;
     newWallets: number;
     jobsEnqueued: number;
+    highestIdProbed: number;
   }> {
-    console.info('[RescanOrchestrator] syncNewProfiles: starting profile sync delta');
+    const db = this.getDbFn();
+    const ethosClient = new EthosApiClient();
 
-    // ProfileSyncService.runFullSync handles upserts and new_user enqueue internally.
-    // The new-user fast path in upsertWallets enqueues jobs for new wallet rows.
-    const stats = await this.profileSync.runFullSync();
+    // Get highest profile ID we've seen
+    const result = await db.execute(
+      sql`SELECT MAX(CAST(external_profile_id AS INTEGER)) as max_id FROM profiles WHERE external_profile_id ~ '^[0-9]+$'`
+    );
+    const rows = result.rows as Array<{ max_id: string | null }>;
+    const highestSeen = parseInt(rows[0]?.max_id ?? '0', 10) || 0;
+
+    console.info(`[RescanOrchestrator] syncNewProfiles: probing from profile ID ${highestSeen + 1}`);
+
+    const maxMisses = env.NEW_USER_PROBE_MAX_MISSES;
+    const concurrency = env.ETHOS_API_CONCURRENCY;
+    let consecutiveMisses = 0;
+    let currentId = highestSeen + 1;
+    let newProfiles = 0;
+    let newWallets = 0;
+    let highestIdProbed = highestSeen;
+
+    // Concurrency limiter (reuse Ethos API rate limit pattern)
+    function createLimiter(max: number) {
+      let running = 0;
+      const queue: Array<{ fn: () => Promise<unknown>; resolve: (v: unknown) => void; reject: (e: unknown) => void }> = [];
+      const next = () => {
+        if (!queue.length || running >= max) return;
+        running++;
+        const { fn, resolve, reject } = queue.shift()!;
+        fn().then(resolve, reject).finally(() => { running--; next(); });
+      };
+      return <T>(fn: () => Promise<T>): Promise<T> =>
+        new Promise((resolve, reject) => { queue.push({ fn, resolve: resolve as (v: unknown) => void, reject }); next(); });
+    }
+    const limit = createLimiter(concurrency);
+
+    while (consecutiveMisses < maxMisses) {
+      // Build a batch of IDs to probe
+      const batchSize = Math.min(concurrency, maxMisses - consecutiveMisses + 1);
+      const batchIds = Array.from({ length: batchSize }, (_, i) => currentId + i);
+      currentId += batchSize;
+
+      const results = await Promise.allSettled(
+        batchIds.map((id) => limit(() => ethosClient.getProfileAddresses(id).then((data) => ({ id, data }))))
+      );
+
+      let batchHadHit = false;
+      for (const result of results) {
+        if (result.status === 'rejected') continue;
+        const { id, data } = result.value;
+        highestIdProbed = Math.max(highestIdProbed, id);
+
+        if (!data || data.allAddresses.length === 0) {
+          consecutiveMisses++;
+          continue;
+        }
+
+        // Found a new profile — reset miss counter
+        consecutiveMisses = 0;
+        batchHadHit = true;
+
+        try {
+          await this.profileSync.syncProfile(id);
+          newProfiles++;
+          newWallets += data.allAddresses.length * 6; // 6 chains per address
+        } catch (err) {
+          console.warn(`[RescanOrchestrator] syncNewProfiles: failed to sync profile ${id}:`, err);
+        }
+      }
+
+      if (!batchHadHit && consecutiveMisses >= maxMisses) break;
+    }
 
     console.info(
-      `[RescanOrchestrator] syncNewProfiles: processed ${stats.profilesProcessed} profiles, ` +
-      `upserted ${stats.walletsUpserted} wallets`,
+      `[RescanOrchestrator] syncNewProfiles: found ${newProfiles} new profiles, ` +
+      `highest ID probed: ${highestIdProbed}, stopped after ${consecutiveMisses} consecutive misses`
     );
 
-    // stats.walletsUpserted counts all rows attempted — new + updated.
-    // The profileSync service internally enqueues new_user jobs for genuinely new rows.
-    // We report walletsUpserted as a proxy for new wallets (conservative).
     return {
-      newProfiles: stats.profilesUpserted,
-      newWallets: stats.walletsUpserted,
-      jobsEnqueued: stats.walletsUpserted, // each new wallet gets a new_user job
+      newProfiles,
+      newWallets,
+      jobsEnqueued: newProfiles, // new_user jobs auto-enqueued by ProfileSyncService
+      highestIdProbed,
     };
   }
 
