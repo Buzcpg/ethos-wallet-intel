@@ -8,6 +8,11 @@ import type { JobType, WalletScanJob } from '../jobs/types.js';
 const STALE_JOB_TIMEOUT_MS = 5 * 60 * 1000;   // 5 minutes
 const STALE_RESET_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 
+// Minimum pause between ticks when the queue is empty (avoid tight DB polling loop)
+const IDLE_POLL_MS = env.WORKER_POLL_INTERVAL_MS;
+// Minimum pause between ticks when jobs were found (yield the event loop, don't hammer DB)
+const BUSY_POLL_MS = 50;
+
 let running = false;
 let shutdownRequested = false;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -18,18 +23,23 @@ export function isRunning(): boolean {
 }
 
 // H1 — process up to WORKER_CONCURRENCY jobs per tick using Promise.allSettled.
+// When jobs were found, loop back immediately (BUSY_POLL_MS) to keep throughput high.
+// When the queue is empty, back off to IDLE_POLL_MS to avoid hammering Postgres.
 async function processTick(): Promise<void> {
   if (shutdownRequested) return;
+
+  let didWork = false;
 
   try {
     const concurrency = env.WORKER_CONCURRENCY;
 
-    // Dequeue up to `concurrency` jobs atomically (FOR UPDATE SKIP LOCKED ensures no overlap)
+    // Dequeue up to `concurrency` jobs atomically (FOR UPDATE SKIP LOCKED — no overlap)
     const dequeuePromises = Array.from({ length: concurrency }, () => dequeueNext());
     const dequeued = await Promise.all(dequeuePromises);
     const jobs = dequeued.filter((j): j is WalletScanJob => j !== null);
 
     if (jobs.length > 0) {
+      didWork = true;
       await Promise.allSettled(
         jobs.map(async (job) => {
           const handler = jobRegistry[job.jobType as JobType];
@@ -55,7 +65,9 @@ async function processTick(): Promise<void> {
   }
 
   if (!shutdownRequested) {
-    pollTimer = setTimeout(processTick, env.WORKER_POLL_INTERVAL_MS);
+    // Loop back quickly while queue is hot; idle poll when empty
+    const delay = didWork ? BUSY_POLL_MS : IDLE_POLL_MS;
+    pollTimer = setTimeout(processTick, delay);
   }
 }
 
@@ -67,7 +79,7 @@ export async function startWorker(): Promise<void> {
 
   running = true;
   shutdownRequested = false;
-  console.log(`[worker] started — polling every ${env.WORKER_POLL_INTERVAL_MS}ms, concurrency=${env.WORKER_CONCURRENCY}`);
+  console.log(`[worker] started — idle poll ${IDLE_POLL_MS}ms, busy poll ${BUSY_POLL_MS}ms, concurrency=${env.WORKER_CONCURRENCY}`);
 
   // C3 — reset stale jobs at startup
   try {
