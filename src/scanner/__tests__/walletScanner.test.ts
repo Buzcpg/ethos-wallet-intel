@@ -46,6 +46,7 @@ const CHAIN = 'ethereum' as const;
 function makeMockDb(opts: {
   walletFound?: boolean;
   lastScannedAt?: Date | null;
+  lastScannedBlock?: bigint | null;
   existingSignal?: boolean;
 }) {
   const db = {
@@ -61,6 +62,7 @@ function makeMockDb(opts: {
                   {
                     address: WALLET_ADDR,
                     lastScannedAt: opts.lastScannedAt ?? null,
+                    lastScannedBlock: opts.lastScannedBlock ?? null,
                   },
                 ]);
               }
@@ -69,6 +71,9 @@ function makeMockDb(opts: {
               }
               return Promise.resolve([]);
             },
+          }),
+          orderBy: (_c: unknown) => ({
+            limit: (_n: number) => Promise.resolve([]),
           }),
         };
       },
@@ -133,6 +138,10 @@ describe('WalletScanner', () => {
     vi.mocked(DepositScanner).mockImplementation(() => mockDeposit as never);
     vi.mocked(P2PScanner).mockImplementation(() => mockP2P as never);
   });
+
+  // -------------------------------------------------------------------------
+  // Full scan tests (existing)
+  // -------------------------------------------------------------------------
 
   it('runs all three extractors with a single tx fetch', async () => {
     const db = makeMockDb({ walletFound: true, lastScannedAt: null });
@@ -206,5 +215,191 @@ describe('WalletScanner', () => {
     await walletScanner.scanWallet(WALLET_ID, CHAIN);
 
     expect(updates.length).toBeGreaterThan(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // Delta scan tests (new in M5)
+  // -------------------------------------------------------------------------
+
+  it('deltaScanWallet falls back to full scan when lastScannedBlock is null', async () => {
+    const db = makeMockDb({
+      walletFound: true,
+      lastScannedBlock: null,
+      lastScannedAt: null,
+    });
+    const walletScanner = new WalletScanner(() => db as never);
+
+    // Mock scanWallet to track if it was called
+    const scanWalletSpy = vi.spyOn(walletScanner, 'scanWallet').mockResolvedValue({
+      walletId: WALLET_ID,
+      chain: CHAIN,
+      transactionsFetched: 10,
+      firstFunderFound: true,
+      depositEvidenceFound: 1,
+      p2pMatchesFound: 0,
+      partial: false,
+      deepScanReasons: [],
+      durationMs: 100,
+    });
+
+    await walletScanner.deltaScanWallet(WALLET_ID, CHAIN);
+
+    expect(scanWalletSpy).toHaveBeenCalledWith(WALLET_ID, CHAIN);
+  });
+
+  it('deltaScanWallet returns early with transactionsFetched=0 when no new txs', async () => {
+    const db = makeMockDb({
+      walletFound: true,
+      lastScannedBlock: 5000n,
+      lastScannedAt: new Date(),
+    });
+
+    // Fetcher returns empty result
+    mockFetcher.fetchAll.mockResolvedValue({
+      transactions: [],
+      totalFetched: 0,
+      chain: CHAIN,
+      address: WALLET_ADDR,
+      partial: false,
+    });
+
+    const walletScanner = new WalletScanner(() => db as never);
+    const result = await walletScanner.deltaScanWallet(WALLET_ID, CHAIN);
+
+    expect(result.transactionsFetched).toBe(0);
+    expect(mockFirstFunder.extractFromTransactions).not.toHaveBeenCalled();
+    expect(mockDeposit.scanTransactions).not.toHaveBeenCalled();
+    expect(mockP2P.scanTransactions).not.toHaveBeenCalled();
+  });
+
+  it('deltaScanWallet fetches from lastScannedBlock + 1', async () => {
+    const db = makeMockDb({
+      walletFound: true,
+      lastScannedBlock: 5000n,
+      lastScannedAt: new Date(),
+    });
+
+    const newTxs = [
+      {
+        txHash: '0xnew1',
+        fromAddress: '0xsomeone',
+        toAddress: WALLET_ADDR,
+        blockNumber: 5001n,
+        blockTimestamp: new Date(),
+        valueWei: '1000',
+        isInbound: true,
+        chain: CHAIN,
+      },
+    ];
+
+    mockFetcher.fetchAll.mockResolvedValue({
+      transactions: newTxs,
+      totalFetched: 1,
+      chain: CHAIN,
+      address: WALLET_ADDR,
+      fromBlock: 5001n,
+      toBlock: 5001n,
+      partial: false,
+    });
+
+    const walletScanner = new WalletScanner(() => db as never);
+    const result = await walletScanner.deltaScanWallet(WALLET_ID, CHAIN);
+
+    // fetchAll called with fromBlock = 5001n
+    expect(mockFetcher.fetchAll).toHaveBeenCalledWith(WALLET_ADDR, { fromBlock: 5001n });
+    expect(result.transactionsFetched).toBe(1);
+  });
+
+  it('deltaScanWallet updates lastScannedBlock to highest block seen', async () => {
+    const db = makeMockDb({
+      walletFound: true,
+      lastScannedBlock: 5000n,
+      lastScannedAt: new Date(),
+    });
+
+    const updates: unknown[] = [];
+    db.update = (_: unknown) => ({
+      set: (vals: unknown) => {
+        updates.push(vals);
+        return { where: (_c: unknown) => Promise.resolve() };
+      },
+    });
+
+    const newTxs = [
+      {
+        txHash: '0xnew',
+        fromAddress: '0xsomeone',
+        toAddress: WALLET_ADDR,
+        blockNumber: 6000n,
+        blockTimestamp: new Date(),
+        valueWei: '1000',
+        isInbound: true,
+        chain: CHAIN,
+      },
+    ];
+
+    mockFetcher.fetchAll.mockResolvedValue({
+      transactions: newTxs,
+      totalFetched: 1,
+      chain: CHAIN,
+      address: WALLET_ADDR,
+      fromBlock: 5001n,
+      toBlock: 6000n,
+      partial: false,
+    });
+
+    const walletScanner = new WalletScanner(() => db as never);
+    await walletScanner.deltaScanWallet(WALLET_ID, CHAIN);
+
+    expect(updates.length).toBeGreaterThan(0);
+    const updateVals = updates[0] as Record<string, unknown>;
+    expect(updateVals).toHaveProperty('lastScannedBlock', 6000n);
+  });
+
+  it('deltaScanWallet returns error when wallet not found', async () => {
+    const db = makeMockDb({ walletFound: false });
+    const walletScanner = new WalletScanner(() => db as never);
+
+    const result = await walletScanner.deltaScanWallet(WALLET_ID, CHAIN);
+
+    expect(result.error).toContain(WALLET_ID);
+    expect(mockFetcher.fetchAll).not.toHaveBeenCalled();
+  });
+
+  it('deltaScanWallet runs all three extractors when new txs found', async () => {
+    const db = makeMockDb({
+      walletFound: true,
+      lastScannedBlock: 5000n,
+      lastScannedAt: new Date(),
+    });
+
+    const newTxs = [
+      {
+        txHash: '0xnew',
+        fromAddress: '0xsomeone',
+        toAddress: WALLET_ADDR,
+        blockNumber: 5001n,
+        blockTimestamp: new Date(),
+        valueWei: '500',
+        isInbound: true,
+        chain: CHAIN,
+      },
+    ];
+
+    mockFetcher.fetchAll.mockResolvedValue({
+      transactions: newTxs,
+      totalFetched: 1,
+      chain: CHAIN,
+      address: WALLET_ADDR,
+      toBlock: 5001n,
+      partial: false,
+    });
+
+    const walletScanner = new WalletScanner(() => db as never);
+    await walletScanner.deltaScanWallet(WALLET_ID, CHAIN);
+
+    expect(mockFirstFunder.extractFromTransactions).toHaveBeenCalledOnce();
+    expect(mockDeposit.scanTransactions).toHaveBeenCalledOnce();
+    expect(mockP2P.scanTransactions).toHaveBeenCalledOnce();
   });
 });

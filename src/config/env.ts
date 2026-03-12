@@ -17,6 +17,9 @@ const envSchema = z.object({
   ETHERSCAN_API_KEY: z.string().optional(),
   POLYGONSCAN_API_KEY: z.string().optional(),
   SNOWTRACE_API_KEY: z.string().optional(),
+  // Supabase — profile ID enumeration (faster than Ethos API pagination)
+  SUPABASE_URL: z.string().url().optional(),
+  SUPABASE_ANON_KEY: z.string().optional(),
   // Scanner settings
   SCANNER_CONCURRENCY: z.coerce.number().int().positive().default(5),
   SCANNER_DELAY_MS: z.coerce.number().int().nonnegative().default(200),
@@ -28,6 +31,13 @@ const envSchema = z.object({
   SCAN_WINDOW_LAST:  z.coerce.number().int().positive().default(300),
   // Delay between pages during overnight deep_scan jobs (stay within rate limits)
   DEEP_SCAN_PAGE_DELAY_MS: z.coerce.number().int().nonnegative().default(2000),
+  // Delta rescan settings
+  // Number of hours between rescans; wallets scanned within this window are skipped
+  RESCAN_INTERVAL_HOURS: z.coerce.number().int().positive().default(24),
+  // Max consecutive 404s before stopping new profile ID probe (IDs have gaps)
+  NEW_USER_PROBE_MAX_MISSES: z.coerce.number().int().positive().default(200),
+  // Max pages to fetch in a delta scan (only new transactions since last_scanned_block)
+  SCAN_MAX_PAGES_DELTA: z.coerce.number().int().positive().default(10),
 });
 
 const parsed = envSchema.safeParse(process.env);
