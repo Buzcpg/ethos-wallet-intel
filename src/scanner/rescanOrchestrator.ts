@@ -6,7 +6,7 @@ import { env } from '../config/env.js';
 import { enqueueJob } from '../queue/index.js';
 import { ProfileSyncService } from '../sync/profileSync.js';
 import { SupabaseSync, type SupabaseProfileRow } from '../sync/supabaseSync.js';
-import { EthosApiClient } from '../ethos/client.js';
+import { EthosApiClient, createLimiter } from '../ethos/client.js';
 import { sql } from 'drizzle-orm';
 import { profiles } from '../db/schema/index.js';
 
@@ -77,12 +77,6 @@ export class RescanOrchestrator {
   }
 
   /**
-   * Profile sync delta: run a full profile sync (ProfileSyncService handles
-   * new vs updated wallets internally, enqueueing new_user jobs for new wallets).
-   *
-   * Returns counts of new profiles, new wallets, and jobs enqueued.
-   */
-  /**
    * Forward-probe for new Ethos profiles since our last known profile ID.
    *
    * Strategy:
@@ -102,12 +96,10 @@ export class RescanOrchestrator {
     const db = this.getDbFn();
     const ethosClient = new EthosApiClient();
 
-    // Get highest profile ID we've seen
-    const result = await db.execute(
-      sql`SELECT MAX(CAST(external_profile_id AS INTEGER)) as max_id FROM profiles WHERE external_profile_id ~ '^[0-9]+$'`
-    );
-    const rows = result.rows as Array<{ max_id: string | null }>;
-    const highestSeen = parseInt(rows[0]?.max_id ?? '0', 10) || 0;
+    // Get highest profile ID we've seen (L4: column is integer — no CAST or regex needed)
+    const result = await db.execute(sql`SELECT MAX(external_profile_id) as max_id FROM profiles`);
+    const rows = result.rows as Array<{ max_id: number | null }>;
+    const highestSeen = rows[0]?.max_id ?? 0;
 
     console.info(`[RescanOrchestrator] syncNewProfiles: probing from profile ID ${highestSeen + 1}`);
 
@@ -126,19 +118,6 @@ export class RescanOrchestrator {
     let newWallets = 0;
     let highestIdProbed = highestSeen;
 
-    // Concurrency limiter (reuse Ethos API rate limit pattern)
-    function createLimiter(max: number) {
-      let running = 0;
-      const queue: Array<{ fn: () => Promise<unknown>; resolve: (v: unknown) => void; reject: (e: unknown) => void }> = [];
-      const next = () => {
-        if (!queue.length || running >= max) return;
-        running++;
-        const { fn, resolve, reject } = queue.shift()!;
-        fn().then(resolve, reject).finally(() => { running--; next(); });
-      };
-      return <T>(fn: () => Promise<T>): Promise<T> =>
-        new Promise((resolve, reject) => { queue.push({ fn, resolve: resolve as (v: unknown) => void, reject }); next(); });
-    }
     const limit = createLimiter(concurrency);
 
     while (consecutiveMisses < maxMisses) {
@@ -167,9 +146,9 @@ export class RescanOrchestrator {
         batchHadHit = true;
 
         try {
-          await this.profileSync.syncProfile(id);
+          const syncResult = await this.profileSync.syncProfile(id);
           newProfiles++;
-          newWallets += data.allAddresses.length * 6; // 6 chains per address
+          newWallets += syncResult.walletsUpserted; // actual new rows, not estimated
         } catch (err) {
           console.warn(`[RescanOrchestrator] syncNewProfiles: failed to sync profile ${id}:`, err);
         }
@@ -191,11 +170,6 @@ export class RescanOrchestrator {
     };
   }
 
-  /**
-   * Supabase fast-path: fetch new profile IDs from profiles_v2 table
-   * using PostgREST filter (raw_profile_id > highestSeen).
-   * Exact IDs — no probe, no misses, no waste.
-   */
   /**
    * Supabase fast-path for new profile discovery.
    *
@@ -267,12 +241,12 @@ export class RescanOrchestrator {
   async getDueCounts(): Promise<Record<ChainSlug, number>> {
     const result = {} as Record<ChainSlug, number>;
 
+    // M5: countWalletsDueForRescan issues COUNT(*) only — no ID fetch
     for (const chain of CHAIN_SLUGS) {
-      const ids = await this.walletScanner.getWalletsDueForRescan(
+      result[chain] = await this.walletScanner.countWalletsDueForRescan(
         chain,
         env.RESCAN_INTERVAL_HOURS,
       );
-      result[chain] = ids.length;
     }
 
     return result;

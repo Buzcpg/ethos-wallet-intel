@@ -1,4 +1,4 @@
-import { eq, and } from 'drizzle-orm';
+import { inArray, and, eq } from 'drizzle-orm';
 import { type Db, db as getDb } from '../db/client.js';
 import { depositTransferEvidence } from '../db/schema/index.js';
 import type { ChainSlug } from '../chains/index.js';
@@ -57,48 +57,63 @@ export class DepositScanner {
       labelCache.set(recipient, isCex);
     }
 
-    // Insert one evidence row per qualifying outbound transaction
-    for (const tx of outbound) {
-      if (!tx.toAddress) continue;
-      if (!labelCache.get(tx.toAddress)) continue;
+    // H3 — identify CEX-touching transactions first, then do ONE bulk existence check
+    const cexTxs = outbound.filter((tx) => tx.toAddress && labelCache.get(tx.toAddress));
 
-      // Idempotency check: unique on (txHash, chain)
-      const existing = await database
-        .select({ id: depositTransferEvidence.id })
-        .from(depositTransferEvidence)
-        .where(
-          and(
-            eq(depositTransferEvidence.txHash, tx.txHash),
-            eq(depositTransferEvidence.chain, chain),
-          ),
-        )
-        .limit(1);
+    if (cexTxs.length === 0) {
+      return { walletId, chain, depositsFound: 0, evidenceIds: [] };
+    }
 
-      if (existing.length > 0) {
-        evidenceIds.push(existing[0]!.id);
-        depositsFound++;
-        continue;
-      }
+    const txHashes = cexTxs.map((tx) => tx.txHash);
 
-      const transferType = tx.tokenContractAddress ? 'erc20' : 'native';
+    // One bulk WHERE txHash = ANY(…) AND chain = … check
+    const existingRows =
+      txHashes.length > 0
+        ? await database
+            .select({ txHash: depositTransferEvidence.txHash, id: depositTransferEvidence.id })
+            .from(depositTransferEvidence)
+            .where(
+              and(
+                inArray(depositTransferEvidence.txHash, txHashes),
+                eq(depositTransferEvidence.chain, chain),
+              ),
+            )
+        : [];
 
+    const existingByHash = new Map(existingRows.map((r) => [r.txHash, r.id]));
+
+    // Bulk-insert only the new ones in a single statement
+    const toInsert = cexTxs.filter((tx) => !existingByHash.has(tx.txHash));
+
+    if (toInsert.length > 0) {
       const inserted = await database
         .insert(depositTransferEvidence)
-        .values({
-          walletId,
-          chain,
-          recipientAddress: tx.toAddress,
-          txHash: tx.txHash,
-          transferType,
-          tokenSymbol: tx.tokenSymbol ?? null,
-          amountRaw: tx.tokenValueRaw ?? tx.valueWei,
-          blockNumber: tx.blockNumber,
-          blockTimestamp: tx.blockTimestamp,
-        })
-        .returning({ id: depositTransferEvidence.id });
+        .values(
+          toInsert.map((tx) => ({
+            walletId,
+            chain,
+            recipientAddress: tx.toAddress,
+            txHash: tx.txHash,
+            transferType: (tx.tokenContractAddress ? 'erc20' : 'native') as 'erc20' | 'native',
+            tokenSymbol: tx.tokenSymbol ?? null,
+            amountRaw: tx.tokenValueRaw ?? tx.valueWei,
+            blockNumber: tx.blockNumber,
+            blockTimestamp: tx.blockTimestamp,
+          })),
+        )
+        .returning({ id: depositTransferEvidence.id, txHash: depositTransferEvidence.txHash });
 
-      if (inserted.length > 0) {
-        evidenceIds.push(inserted[0]!.id);
+      for (const row of inserted) {
+        evidenceIds.push(row.id);
+        depositsFound++;
+      }
+    }
+
+    // Include already-existing evidence in the result
+    for (const tx of cexTxs) {
+      const existingId = existingByHash.get(tx.txHash);
+      if (existingId) {
+        evidenceIds.push(existingId);
         depositsFound++;
       }
     }

@@ -16,7 +16,7 @@
  *   5. (Removed addresses are NOT deleted — historical wallet data is preserved)
  */
 
-import { eq, inArray } from 'drizzle-orm';
+import { eq, asc } from 'drizzle-orm';
 import { db as getDb, type Db } from '../db/client.js';
 import { profiles, wallets } from '../db/schema/index.js';
 import { env } from '../config/env.js';
@@ -32,6 +32,9 @@ export interface DriftCheckStats {
 }
 
 const BATCH_SIZE = 500;
+
+// H5 — sub-batch size for Supabase URL to avoid URL-length overflow with 500 IDs
+const SUPABASE_SUB_BATCH = 100;
 
 export class WalletDriftChecker {
   private readonly getDbFn: () => Db;
@@ -73,25 +76,34 @@ export class WalletDriftChecker {
     let offset = 0;
 
     while (true) {
+      // H6 — ORDER BY profiles.id for stable, deterministic pagination
       const knownProfiles = await db
         .select({ id: profiles.id, externalProfileId: profiles.externalProfileId })
         .from(profiles)
+        .orderBy(asc(profiles.id))
         .limit(BATCH_SIZE)
         .offset(offset);
 
       if (knownProfiles.length === 0) break;
 
-      // Map external_profile_id (string) → internal UUID
+      // Map external_profile_id (integer) → internal UUID
       const idMap = new Map<number, string>(); // raw_profile_id → internal UUID
       for (const p of knownProfiles) {
-        const raw = parseInt(p.externalProfileId, 10);
-        if (!isNaN(raw)) idMap.set(raw, p.id);
+        // L4: externalProfileId is integer — no parseInt/isNaN needed
+        if (p.externalProfileId !== null) idMap.set(p.externalProfileId, p.id);
       }
 
       const rawIds = Array.from(idMap.keys());
 
-      // Fetch profiles_v2 rows from Supabase for this batch
-      const supabaseRows = await this.fetchSupabaseRows(rawIds);
+      // H5 — paginate fetchSupabaseRows into sub-batches of 100 to avoid URL overflow
+      let supabaseRows: SupabaseProfileRow[];
+      try {
+        supabaseRows = await this.fetchSupabaseRows(rawIds);
+      } catch (err) {
+        console.warn('[WalletDriftChecker] Supabase batch fetch failed — aborting run:', err);
+        stats.errors++;
+        break;
+      }
 
       for (const row of supabaseRows) {
         try {
@@ -148,27 +160,39 @@ export class WalletDriftChecker {
   }
 
   /**
-   * Fetch profiles_v2 rows from Supabase for the given raw_profile_ids.
-   * Uses the `in` filter: ?raw_profile_id=in.(1,2,3)
+   * H5 — Fetch profiles_v2 rows from Supabase for the given raw_profile_ids.
+   * Paginates rawIds into sub-batches of SUPABASE_SUB_BATCH (100) before building
+   * URLs to avoid URL-length overflow with large ID lists.
+   * Fires sub-batches sequentially and concatenates results.
    */
   private async fetchSupabaseRows(rawIds: number[]): Promise<SupabaseProfileRow[]> {
     if (rawIds.length === 0) return [];
 
-    const url = new URL(`${env.SUPABASE_URL}/rest/v1/profiles_v2`);
-    url.searchParams.set('select', 'raw_profile_id,display_name,username,status,score,userkeys');
-    url.searchParams.set('raw_profile_id', `in.(${rawIds.join(',')})`);
+    const allRows: SupabaseProfileRow[] = [];
 
-    const res = await fetch(url.toString(), {
-      headers: {
-        apikey: env.SUPABASE_ANON_KEY!,
-        Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
-      },
-    });
+    // Split into sub-batches of 100
+    for (let i = 0; i < rawIds.length; i += SUPABASE_SUB_BATCH) {
+      const subBatch = rawIds.slice(i, i + SUPABASE_SUB_BATCH);
 
-    if (!res.ok) {
-      throw new Error(`Supabase fetch failed: ${res.status} ${res.statusText}`);
+      const url = new URL(`${env.SUPABASE_URL}/rest/v1/profiles_v2`);
+      url.searchParams.set('select', 'raw_profile_id,display_name,username,status,score,userkeys');
+      url.searchParams.set('raw_profile_id', `in.(${subBatch.join(',')})`);
+
+      const res = await fetch(url.toString(), {
+        headers: {
+          apikey: env.SUPABASE_ANON_KEY!,
+          Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
+        },
+      });
+
+      if (!res.ok) {
+        throw new Error(`Supabase fetch failed: ${res.status} ${res.statusText}`);
+      }
+
+      const rows = (await res.json()) as SupabaseProfileRow[];
+      allRows.push(...rows);
     }
 
-    return res.json() as Promise<SupabaseProfileRow[]>;
+    return allRows;
   }
 }

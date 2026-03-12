@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { sql } from 'drizzle-orm';
+import { createTask } from '../taskRegistry.js';
 import { isValidChain, CHAIN_SLUGS } from '../../chains/index.js';
 import type { ChainSlug } from '../../chains/index.js';
 import { FirstFunderScanner } from '../../scanner/firstFunderScanner.js';
@@ -111,6 +112,7 @@ scanner.post('/full-scan-wallet', async (c) => {
 });
 
 // POST /scanner/full-scan-batch
+// H7 — Long-running: returns 202 immediately; poll GET /tasks/:taskId for results.
 scanner.post('/full-scan-batch', async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = scanBatchSchema.safeParse(body);
@@ -118,24 +120,28 @@ scanner.post('/full-scan-batch', async (c) => {
     return c.json({ error: 'Invalid request', details: parsed.error.flatten() }, 400);
   }
   const { chain, limit } = parsed.data;
-  const walletScanner = new WalletScanner();
-  const walletIds = await walletScanner.getUnscannedWallets(chain as ChainSlug, limit);
-  if (walletIds.length === 0) {
-    return c.json({
-      chain,
-      scanned: 0,
-      skipped: 0,
-      errors: 0,
-      totalTransactionsFetched: 0,
-      totalFirstFundersFound: 0,
-      totalDepositEvidenceFound: 0,
-      totalP2PMatchesFound: 0,
-      durationMs: 0,
-      results: [],
-    });
-  }
-  const result = await walletScanner.scanBatch(walletIds, chain as ChainSlug);
-  return c.json(result);
+
+  const taskId = createTask(async () => {
+    const walletScanner = new WalletScanner();
+    const walletIds = await walletScanner.getUnscannedWallets(chain as ChainSlug, limit);
+    if (walletIds.length === 0) {
+      return {
+        chain,
+        scanned: 0,
+        skipped: 0,
+        errors: 0,
+        totalTransactionsFetched: 0,
+        totalFirstFundersFound: 0,
+        totalDepositEvidenceFound: 0,
+        totalP2PMatchesFound: 0,
+        durationMs: 0,
+        results: [],
+      };
+    }
+    return walletScanner.scanBatch(walletIds, chain as ChainSlug);
+  });
+
+  return c.json({ taskId, status: 'accepted' }, 202);
 });
 
 // GET /scanner/deposit-stats
@@ -147,15 +153,22 @@ scanner.get('/deposit-stats', async (c) => {
     return parseInt(result.rows[0]?.count ?? '0', 10);
   };
 
-  const chains: Record<string, { depositEvidenceCount: number }> = {};
-  for (const chain of CHAIN_SLUGS) {
-    const count = await countRows(
-      sql`SELECT count(*)::text AS count FROM ${depositTransferEvidence} WHERE chain = ${chain}`,
+  try {
+    const chains: Record<string, { depositEvidenceCount: number }> = {};
+    await Promise.all(
+      CHAIN_SLUGS.map(async (chain) => {
+        const count = await countRows(
+          sql`SELECT count(*)::text AS count FROM ${depositTransferEvidence} WHERE chain = ${chain}`,
+        );
+        chains[chain] = { depositEvidenceCount: count };
+      }),
     );
-    chains[chain] = { depositEvidenceCount: count };
+    return c.json({ chains });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[scanner] deposit-stats failed:', err);
+    return c.json({ error: 'Failed to fetch deposit stats', details: message }, 500);
   }
-
-  return c.json({ chains });
 });
 
 // GET /scanner/p2p-stats
@@ -167,15 +180,22 @@ scanner.get('/p2p-stats', async (c) => {
     return parseInt(result.rows[0]?.count ?? '0', 10);
   };
 
-  const chains: Record<string, { p2pMatchCount: number }> = {};
-  for (const chain of CHAIN_SLUGS) {
-    const count = await countRows(
-      sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain} AND match_type = 'direct_wallet_interaction'`,
+  try {
+    const chains: Record<string, { p2pMatchCount: number }> = {};
+    await Promise.all(
+      CHAIN_SLUGS.map(async (chain) => {
+        const count = await countRows(
+          sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain} AND match_type = 'direct_wallet_interaction'`,
+        );
+        chains[chain] = { p2pMatchCount: count };
+      }),
     );
-    chains[chain] = { p2pMatchCount: count };
+    return c.json({ chains });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[scanner] p2p-stats failed:', err);
+    return c.json({ error: 'Failed to fetch p2p stats', details: message }, 500);
   }
-
-  return c.json({ chains });
 });
 
 // ---------------------------------------------------------------------------
@@ -184,9 +204,15 @@ scanner.get('/p2p-stats', async (c) => {
 
 // POST /labels/seed
 scanner.post('/labels/seed', async (c) => {
-  const resolver = new LabelResolver();
-  await resolver.seedFromStaticList();
-  return c.json({ success: true, message: 'Label seed complete (idempotent)' });
+  try {
+    const resolver = new LabelResolver();
+    await resolver.seedFromStaticList();
+    return c.json({ success: true, message: 'Label seed complete (idempotent)' });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[scanner] label seed failed:', err);
+    return c.json({ error: 'Label seed failed', details: message }, 500);
+  }
 });
 
 // POST /labels/resolve
@@ -197,12 +223,18 @@ scanner.post('/labels/resolve', async (c) => {
     return c.json({ error: 'Invalid request', details: parsed.error.flatten() }, 400);
   }
   const { address, chain } = parsed.data;
-  const resolver = new LabelResolver();
-  const label = await resolver.resolveLabel(address, chain as ChainSlug);
-  if (!label) {
-    return c.json({ address, chain, label: null });
+  try {
+    const resolver = new LabelResolver();
+    const label = await resolver.resolveLabel(address, chain as ChainSlug);
+    if (!label) {
+      return c.json({ address, chain, label: null });
+    }
+    return c.json({ address, chain, label });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[scanner] label resolve failed:', err);
+    return c.json({ error: 'Label resolution failed', details: message }, 500);
   }
-  return c.json({ address, chain, label });
 });
 
 // ---------------------------------------------------------------------------
@@ -218,48 +250,58 @@ scanner.get('/stats', async (c) => {
     return parseInt(result.rows[0]?.count ?? '0', 10);
   };
 
-  const chains: Record<
-    string,
-    {
-      totalWallets: number;
-      scanned: number;
-      withFirstFunder: number;
-      matches: number;
-      depositEvidence: number;
-      p2pMatches: number;
-    }
-  > = {};
+  try {
+    const chains: Record<
+      string,
+      {
+        totalWallets: number;
+        scanned: number;
+        withFirstFunder: number;
+        matches: number;
+        depositEvidence: number;
+        p2pMatches: number;
+      }
+    > = {};
 
-  for (const chain of CHAIN_SLUGS) {
-    const [total, scanned, withFirstFunder, matches, depositEvidenceCount, p2pMatchCount] =
-      await Promise.all([
-        countRows(sql`SELECT count(*)::text AS count FROM ${wallets} WHERE chain = ${chain}`),
-        countRows(
-          sql`SELECT count(*)::text AS count FROM ${wallets} WHERE chain = ${chain} AND last_scanned_at IS NOT NULL`,
-        ),
-        countRows(
-          sql`SELECT count(*)::text AS count FROM ${firstFunderSignals} WHERE chain = ${chain}`,
-        ),
-        countRows(sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain}`),
-        countRows(
-          sql`SELECT count(*)::text AS count FROM ${depositTransferEvidence} WHERE chain = ${chain}`,
-        ),
-        countRows(
-          sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain} AND match_type = 'direct_wallet_interaction'`,
-        ),
-      ]);
+    await Promise.all(
+      CHAIN_SLUGS.map(async (chain) => {
+        const [total, scanned, withFirstFunder, matches, depositEvidenceCount, p2pMatchCount] =
+          await Promise.all([
+            countRows(sql`SELECT count(*)::text AS count FROM ${wallets} WHERE chain = ${chain}`),
+            countRows(
+              sql`SELECT count(*)::text AS count FROM ${wallets} WHERE chain = ${chain} AND last_scanned_at IS NOT NULL`,
+            ),
+            countRows(
+              sql`SELECT count(*)::text AS count FROM ${firstFunderSignals} WHERE chain = ${chain}`,
+            ),
+            countRows(
+              sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain}`,
+            ),
+            countRows(
+              sql`SELECT count(*)::text AS count FROM ${depositTransferEvidence} WHERE chain = ${chain}`,
+            ),
+            countRows(
+              sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain} AND match_type = 'direct_wallet_interaction'`,
+            ),
+          ]);
 
-    chains[chain] = {
-      totalWallets: total,
-      scanned,
-      withFirstFunder,
-      matches,
-      depositEvidence: depositEvidenceCount,
-      p2pMatches: p2pMatchCount,
-    };
+        chains[chain] = {
+          totalWallets: total,
+          scanned,
+          withFirstFunder,
+          matches,
+          depositEvidence: depositEvidenceCount,
+          p2pMatches: p2pMatchCount,
+        };
+      }),
+    );
+
+    return c.json({ chains });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[scanner] stats failed:', err);
+    return c.json({ error: 'Failed to fetch stats', details: message }, 500);
   }
-
-  return c.json({ chains });
 });
 
 export default scanner;

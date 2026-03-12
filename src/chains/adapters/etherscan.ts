@@ -2,14 +2,10 @@ import type { ChainAdapter, FirstInboundTx } from '../adapter.js';
 import type { ChainSlug } from '../index.js';
 import { env } from '../../config/env.js';
 
-// Etherscan-compatible API config per chain
+// Etherscan-compatible API config per chain.
+// L2: optimism and polygon omitted — adapterRegistry.ts routes them to Blockscout.
 const ETHERSCAN_CONFIGS: Record<string, { baseUrl: string; envKey: string }> = {
   ethereum: { baseUrl: 'https://api.etherscan.io/api', envKey: 'ETHERSCAN_API_KEY' },
-  optimism: {
-    baseUrl: 'https://api-optimistic.etherscan.io/api',
-    envKey: 'ETHERSCAN_API_KEY',
-  },
-  polygon: { baseUrl: 'https://api.polygonscan.com/api', envKey: 'POLYGONSCAN_API_KEY' },
   avalanche: { baseUrl: 'https://api.snowtrace.io/api', envKey: 'SNOWTRACE_API_KEY' },
 };
 
@@ -38,7 +34,13 @@ async function fetchWithRetry(url: string, retries = 3, backoffMs = 1000): Promi
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const response = await fetch(url);
-      return response;
+      if (response.ok) return response;
+      if (response.status === 429) {
+        // Rate limited — back off and retry
+        await sleep(backoffMs * (attempt + 1));
+        continue;
+      }
+      throw new Error(`Etherscan API returned ${response.status}`);
     } catch (err) {
       lastErr = err;
       if (attempt < retries - 1) {
@@ -139,7 +141,7 @@ export class EtherscanAdapter implements ChainAdapter {
       startblock: '0',
       endblock: '99999999',
       page: '1',
-      offset: '10',
+      offset: '50', // M3: fetch up to 50 txs so earliest inbound isn't missed on busy wallets
       sort: 'asc',
     });
     if (this.apiKey) {

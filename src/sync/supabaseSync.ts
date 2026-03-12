@@ -117,9 +117,7 @@ export class SupabaseSync {
           continue;
         }
 
-        const internalId = await this.profileSync.getInternalProfileId(
-          row.raw_profile_id.toString(),
-        );
+        const internalId = await this.profileSync.getInternalProfileId(row.raw_profile_id);
         if (!internalId) {
           console.warn('[SupabaseSync] no internal profile row for raw_profile_id=' + row.raw_profile_id);
           stats.errors++;

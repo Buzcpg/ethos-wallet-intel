@@ -42,6 +42,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// TODO(M11): HTML scraping is fragile — Etherscan can change its markup at any time and
+// silently break cross-verification. Replace with an official API call when available
+// (e.g. Etherscan v3 /account/fundingtx endpoint). Monitor for breakage in production.
+
 /**
  * Scrape Etherscan/Snowtrace HTML to extract the "Funded By" address.
  * Returns the funding address (lowercase) or null if not present / on error.
