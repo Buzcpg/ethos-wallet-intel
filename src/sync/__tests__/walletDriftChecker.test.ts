@@ -16,7 +16,7 @@ vi.mock('../../config/env.js', () => ({
 // DB helpers
 // ---------------------------------------------------------------------------
 
-interface ProfileRow { id: string; externalProfileId: string }
+interface ProfileRow { id: string; externalProfileId: number }
 interface WalletRow  { address: string }
 
 function makeMockDb(
@@ -31,6 +31,10 @@ function makeMockDb(
   return {
     select: (_fields: unknown) => ({
       from: (_table: unknown) => ({
+        // H6 — supports optional .orderBy() in the chain before .limit().offset()
+        orderBy: (_c: unknown) => ({
+          limit:  (_n: number)  => ({ offset: (_o: number) => Promise.resolve(profiles) }),
+        }),
         limit:  (_n: number)  => ({ offset: (_o: number) => Promise.resolve(profiles) }),
         where:  (_cond: unknown) => Promise.resolve(wallets),
       }),
@@ -116,7 +120,7 @@ describe('WalletDriftChecker', () => {
 
   it('skips profiles with no new wallet addresses', async () => {
     const db = makeMockDb({
-      profiles: [{ id: 'profile-uuid-1', externalProfileId: '42' }],
+      profiles: [{ id: 'profile-uuid-1', externalProfileId: 42 }],
       wallets:  [{ address: '0xabc' }],  // already stored
     });
 
@@ -143,7 +147,7 @@ describe('WalletDriftChecker', () => {
 
   it('upserts new wallet addresses and increments profilesWithNewWallets', async () => {
     const db = makeMockDb({
-      profiles: [{ id: 'profile-uuid-1', externalProfileId: '42' }],
+      profiles: [{ id: 'profile-uuid-1', externalProfileId: 42 }],
       wallets:  [{ address: '0xabc' }],  // existing wallet
     });
 
@@ -171,7 +175,7 @@ describe('WalletDriftChecker', () => {
 
   it('increments errors and continues when Supabase batch fetch fails', async () => {
     const db = makeMockDb({
-      profiles: [{ id: 'profile-uuid-1', externalProfileId: '42' }],
+      profiles: [{ id: 'profile-uuid-1', externalProfileId: 42 }],
       wallets:  [],
     });
 
@@ -189,7 +193,7 @@ describe('WalletDriftChecker', () => {
 
   it('skips profiles with no addresses in userkeys', async () => {
     const db = makeMockDb({
-      profiles: [{ id: 'profile-uuid-1', externalProfileId: '99' }],
+      profiles: [{ id: 'profile-uuid-1', externalProfileId: 99 }],
       wallets:  [],
     });
 

@@ -48,44 +48,43 @@ function makeMockDb(opts: {
   const profileMatchStore: ProfileMatchRow[] = [...(opts.existingProfileMatches ?? [])];
   let execCallCount = 0;
 
+  // execute calls are interleaved: call 0 = sharedFunder GROUP query,
+  // calls 1..N = existence checks (one per shared funder group, N = sharedFunderRows.length),
+  // call N+1 = direct funder query, calls N+2.. = existence checks for direct funder pairs.
+  const numSharedGroups = (opts.sharedFunderRows ?? []).length;
+  const directFunderCallIdx = 1 + numSharedGroups;
+
   const db = {
     _walletMatches: walletMatchStore,
     _profileMatches: profileMatchStore,
 
-    // execute handles raw SQL (shared funder + direct funder queries)
     execute: vi.fn((_sql: unknown) => {
       const call = execCallCount++;
       if (call === 0) return Promise.resolve({ rows: opts.sharedFunderRows ?? [] });
-      if (call === 1) return Promise.resolve({ rows: opts.directFunderRows ?? [] });
-      return Promise.resolve({ rows: [] });
+      if (call === directFunderCallIdx) return Promise.resolve({ rows: opts.directFunderRows ?? [] });
+      // All other calls are bulk wallet_match existence checks
+      return Promise.resolve({
+        rows: walletMatchStore.map((m) => ({
+          wallet_a_id: m.walletAId,
+          wallet_b_id: m.walletBId,
+        })),
+      });
     }),
 
     select: (_fields: unknown) => ({
       from: (table: unknown) => {
         const name = tableName(table);
         return {
-          // Used for resolveProfileIds (inArray, no .limit)
+          // Used for resolveProfileIds (wallets table, no .limit) and
+          // existingProfileMatches (profile_matches table, no .limit)
           where: (_cond: unknown) => {
             if (name === 'wallets') {
-              // Return the matching walletProfileRows
               return Promise.resolve(opts.walletProfileRows ?? []);
             }
-            // Fallback for wallet_matches / profile_matches — return empty (no existing)
-            return {
-              limit: (_n: number) => {
-                if (name === 'wallet_matches') {
-                  return Promise.resolve(
-                    walletMatchStore.length > 0 ? [walletMatchStore[0]] : [],
-                  );
-                }
-                if (name === 'profile_matches') {
-                  return Promise.resolve(
-                    profileMatchStore.length > 0 ? [profileMatchStore[0]] : [],
-                  );
-                }
-                return Promise.resolve([]);
-              },
-            };
+            if (name === 'profile_matches') {
+              return Promise.resolve([...profileMatchStore]);
+            }
+            return Promise.resolve([]);
           },
         };
       },
@@ -94,9 +93,16 @@ function makeMockDb(opts: {
     insert: (_table: unknown) => {
       const name = tableName(_table);
       return {
-        values: (vals: Record<string, unknown>) => {
-          if (name === 'wallet_matches') walletMatchStore.push(vals as unknown as WalletMatchRow);
-          if (name === 'profile_matches') profileMatchStore.push(vals as unknown as ProfileMatchRow);
+        values: (vals: unknown) => {
+          const valsArray = Array.isArray(vals)
+            ? (vals as Record<string, unknown>[])
+            : [vals as Record<string, unknown>];
+          if (name === 'wallet_matches') {
+            for (const v of valsArray) walletMatchStore.push(v as unknown as WalletMatchRow);
+          }
+          if (name === 'profile_matches') {
+            for (const v of valsArray) profileMatchStore.push(v as unknown as ProfileMatchRow);
+          }
           return Promise.resolve();
         },
       };
