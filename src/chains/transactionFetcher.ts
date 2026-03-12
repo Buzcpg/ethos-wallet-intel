@@ -7,42 +7,72 @@ import { env } from '../config/env.js';
 
 export interface RawTransaction {
   txHash: string;
-  fromAddress: string; // lowercase
-  toAddress: string;   // lowercase, '' for contract creation
+  fromAddress: string;
+  toAddress: string;
   blockNumber: bigint;
   blockTimestamp: Date;
-  valueWei: string;    // native token value as string
-  isInbound: boolean;  // relative to the scanned wallet address
-  chain: ChainSlug;
-  // ERC20 fields (undefined for native txs)
-  tokenSymbol?: string;
+  valueWei: string;
   tokenContractAddress?: string;
+  tokenSymbol?: string;
   tokenValueRaw?: string;
+  isInbound: boolean;
+  chain: ChainSlug;
+}
+
+export interface FetchAllOptions {
+  /** Restrict to transactions from this block number onward (inclusive). */
+  fromBlock?: bigint;
+  /** If true, fetch ALL transactions ignoring window strategy. */
+  deepScan?: boolean;
 }
 
 export interface FetchResult {
   transactions: RawTransaction[];
   totalFetched: number;
-  /**
-   * true when the wallet has more txs than the scan window covers.
-   * The fetcher grabbed first SCAN_WINDOW_FIRST + last SCAN_WINDOW_LAST txs
-   * but skipped the middle. Queue a deep_scan job to fill the gap overnight.
-   */
-  partial: boolean;
   chain: ChainSlug;
   address: string;
+  /** undefined means the scan covered the full window */
   fromBlock?: bigint;
   toBlock?: bigint;
-}
-
-export interface FetchOptions {
-  fromBlock?: bigint;
-  /** If true, fetch ALL transactions (ignores window limits). Used by deep_scan jobs. */
-  deepScan?: boolean;
+  /** true if window scan left a gap in the middle */
+  partial: boolean;
 }
 
 // ---------------------------------------------------------------------------
-// Chain configuration
+// Blockscout API types
+// ---------------------------------------------------------------------------
+
+interface BlockscoutTx {
+  hash: string;
+  from: { hash: string };
+  to: { hash: string } | null;
+  block_number: number | null;
+  timestamp: string;
+  value: string;
+  fee?: { value: string };
+}
+
+interface BlockscoutTokenTransfer {
+  transaction_hash: string;
+  from: { hash: string };
+  to: { hash: string } | null;
+  token: { symbol: string; address: string };
+  total: { value: string };
+  block_number: number | null;
+  timestamp: string;
+}
+
+interface BlockscoutNextPage {
+  [key: string]: string | number | null;
+}
+
+interface BlockscoutPage<T> {
+  items: T[];
+  next_page_params?: BlockscoutNextPage | null;
+}
+
+// ---------------------------------------------------------------------------
+// Blockscout chain config
 // ---------------------------------------------------------------------------
 
 const BLOCKSCOUT_CONFIGS: Record<string, { baseUrl: string }> = {
@@ -51,10 +81,7 @@ const BLOCKSCOUT_CONFIGS: Record<string, { baseUrl: string }> = {
   arbitrum: { baseUrl: 'https://arbitrum.blockscout.com/api/v2' },
   optimism: { baseUrl: 'https://optimism.blockscout.com/api/v2' },
   polygon:  { baseUrl: 'https://polygon.blockscout.com/api/v2' },
-};
-
-const ETHERSCAN_CONFIGS: Record<string, { baseUrl: string; envKey: string }> = {
-  avalanche: { baseUrl: 'https://api.snowtrace.io/api', envKey: 'SNOWTRACE_API_KEY' },
+  avalanche: { baseUrl: 'https://api.snowtrace.io/api/v2/avalanche' },
 };
 
 // ---------------------------------------------------------------------------
@@ -75,7 +102,7 @@ async function fetchWithRetry(url: string, retries = 3, backoffMs = 1000): Promi
         await sleep(backoffMs * (attempt + 1));
         continue;
       }
-      throw new Error(`HTTP ${response.status}`);
+      throw new Error(`Blockscout API returned ${response.status}`);
     } catch (err) {
       lastErr = err;
       if (attempt < retries - 1) await sleep(backoffMs * (attempt + 1));
@@ -84,407 +111,110 @@ async function fetchWithRetry(url: string, retries = 3, backoffMs = 1000): Promi
   throw lastErr;
 }
 
-function deduplicateTxs(txs: RawTransaction[]): RawTransaction[] {
-  const seen = new Set<string>();
-  return txs.filter((tx) => {
-    const key = `${tx.txHash}:${tx.tokenContractAddress ?? 'native'}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
 // ---------------------------------------------------------------------------
-// Blockscout v2 types
+// C4 — normaliseTx: returns null for pending (block_number=null) transactions.
+//      Callers must filter the null out.
+//      Also validates blockTimestamp (M12) — throws on invalid date.
 // ---------------------------------------------------------------------------
 
-interface BlockscoutTx {
-  hash: string;
-  from: { hash: string } | null;
-  to: { hash: string } | null;
-  block_number: number | null;
-  timestamp: string;
-  value: string;
-}
+function normaliseTx(tx: BlockscoutTx, addr: string, chain: ChainSlug): RawTransaction | null {
+  // C4 — skip pending transactions (block_number is null for unconfirmed txs)
+  if (tx.block_number === null || tx.block_number === undefined) {
+    return null;
+  }
 
-interface BlockscoutTokenTransfer {
-  transaction_hash: string;
-  from: { hash: string } | null;
-  to: { hash: string } | null;
-  block_number: number | null;
-  timestamp: string;
-  total?: { value: string };
-  token?: { symbol: string; address: string };
-}
+  // C4 / M12 — validate blockTimestamp
+  const ts = new Date(tx.timestamp);
+  if (isNaN(ts.getTime())) {
+    throw new Error(
+      `[normaliseTx] Invalid blockTimestamp "${tx.timestamp}" for tx ${tx.hash}`,
+    );
+  }
 
-interface BlockscoutPageResponse<T> {
-  items: T[];
-  next_page_params?: Record<string, unknown> | null;
-}
+  const lowerAddr = addr.toLowerCase();
+  const toAddr = tx.to?.hash?.toLowerCase() ?? '';
+  const fromAddr = tx.from.hash.toLowerCase();
 
-// ---------------------------------------------------------------------------
-// Blockscout v2 normalisers
-// ---------------------------------------------------------------------------
-
-function normaliseTx(tx: BlockscoutTx, addr: string, chain: ChainSlug): RawTransaction {
-  const from = tx.from?.hash?.toLowerCase() ?? '';
-  const to   = tx.to?.hash?.toLowerCase()   ?? '';
   return {
     txHash: tx.hash,
-    fromAddress: from,
-    toAddress: to,
-    blockNumber: BigInt(tx.block_number ?? 0),
-    blockTimestamp: new Date(tx.timestamp),
-    valueWei: tx.value ?? '0',
-    isInbound: to === addr,
+    fromAddress: fromAddr,
+    toAddress: toAddr,
+    blockNumber: BigInt(tx.block_number),
+    blockTimestamp: ts,
+    valueWei: tx.value,
+    isInbound: toAddr === lowerAddr,
     chain,
   };
 }
 
-function normaliseTokenTransfer(tx: BlockscoutTokenTransfer, addr: string, chain: ChainSlug): RawTransaction {
-  const from = tx.from?.hash?.toLowerCase() ?? '';
-  const to   = tx.to?.hash?.toLowerCase()   ?? '';
+function normaliseTokenTransfer(
+  tt: BlockscoutTokenTransfer,
+  addr: string,
+  chain: ChainSlug,
+): RawTransaction | null {
+  // C4 — skip pending token transfers
+  if (tt.block_number === null || tt.block_number === undefined) {
+    return null;
+  }
+
+  // C4 / M12 — validate blockTimestamp
+  const ts = new Date(tt.timestamp);
+  if (isNaN(ts.getTime())) {
+    throw new Error(
+      `[normaliseTokenTransfer] Invalid blockTimestamp "${tt.timestamp}" for tx ${tt.transaction_hash}`,
+    );
+  }
+
+  const lowerAddr = addr.toLowerCase();
+  const toAddr = tt.to?.hash?.toLowerCase() ?? '';
+  const fromAddr = tt.from.hash.toLowerCase();
+
   return {
-    txHash: tx.transaction_hash,
-    fromAddress: from,
-    toAddress: to,
-    blockNumber: BigInt(tx.block_number ?? 0),
-    blockTimestamp: new Date(tx.timestamp),
-    valueWei: '0',
-    isInbound: to === addr,
+    txHash: tt.transaction_hash,
+    fromAddress: fromAddr,
+    toAddress: toAddr,
+    blockNumber: BigInt(tt.block_number),
+    blockTimestamp: ts,
+    valueWei: '0', // token transfers carry no native value
+    tokenContractAddress: tt.token.address,
+    tokenSymbol: tt.token.symbol,
+    tokenValueRaw: tt.total.value,
+    isInbound: toAddr === lowerAddr,
     chain,
-    ...(tx.token?.symbol  ? { tokenSymbol: tx.token.symbol } : {}),
-    ...(tx.token?.address ? { tokenContractAddress: tx.token.address.toLowerCase() } : {}),
-    ...(tx.total?.value   ? { tokenValueRaw: tx.total.value } : {}),
   };
 }
 
-async function fetchBlockscoutPage<T>(url: string): Promise<{ items: T[]; nextUrl: string | null }> {
-  const resp = await fetchWithRetry(url, 3, 1000);
-  const data = (await resp.json()) as BlockscoutPageResponse<T>;
-  const next = data.next_page_params;
-  if (!next || Object.keys(next).length === 0) return { items: data.items ?? [], nextUrl: null };
-  const params = new URLSearchParams();
-  for (const [k, v] of Object.entries(next)) params.set(k, String(v));
-  // Preserve the base URL (before any ?) and append next_page_params
-  const base = url.split('?')[0]!;
-  const existingFixed = url.split('?')[1]
-    ?.split('&')
-    .filter(p => !Object.keys(next).includes(p.split('=')[0] ?? ''))
-    .join('&') ?? '';
-  const nextUrl: string = existingFixed
-    ? `${base}?${existingFixed}&${params.toString()}`
-    : `${base}?${params.toString()}`;
-  return { items: data.items ?? [], nextUrl: nextUrl as string | null };
-}
-
 // ---------------------------------------------------------------------------
-// Blockscout v2 — window fetch (first N asc + last M desc, detect gap)
+// M9 — fetchBlockscoutPage: build next-page URLs from scratch.
+//      Take the base URL + path, add fixed params, then spread next_page_params
+//      on top. Never parse or mutate an existing URL string.
 // ---------------------------------------------------------------------------
 
-async function fetchBlockscoutWindow(
+async function fetchBlockscoutPage<T>(
   baseUrl: string,
   address: string,
-  chain: ChainSlug,
-  firstCount: number,
-  lastCount: number,
-  pageDelayMs: number,
-): Promise<{ transactions: RawTransaction[]; partial: boolean }> {
-  const addr = address.toLowerCase();
+  kind: 'transactions' | 'token-transfers',
+  fixedParams: Record<string, string>,
+  nextPageParams?: BlockscoutNextPage | null,
+): Promise<BlockscoutPage<T>> {
+  const url = new URL(`${baseUrl}/addresses/${address}/${kind}`);
 
-  async function fetchNPages<T>(
-    startUrl: string,
-    maxItems: number,
-    normalise: (item: T) => RawTransaction,
-  ): Promise<{ results: RawTransaction[]; exhausted: boolean }> {
-    const results: RawTransaction[] = [];
-    let url: string | null = startUrl;
-    while (url && results.length < maxItems) {
-      try {
-        const { items, nextUrl }: { items: T[]; nextUrl: string | null } = await fetchBlockscoutPage<T>(url);
-        results.push(...items.map(normalise));
-        url = nextUrl;
-        if (url) await sleep(pageDelayMs);
-      } catch (err) {
-        console.warn(`[BlockscoutFetcher:${chain}] page fetch failed:`, err);
-        break;
+  // Fixed params first (address, sort, limit)
+  for (const [k, v] of Object.entries(fixedParams)) {
+    url.searchParams.set(k, v);
+  }
+
+  // next_page_params override/extend the fixed params
+  if (nextPageParams) {
+    for (const [k, v] of Object.entries(nextPageParams)) {
+      if (v !== null && v !== undefined) {
+        url.searchParams.set(k, String(v));
       }
     }
-    return { results, exhausted: url === null };
   }
 
-  const normTx    = (tx: BlockscoutTx)         => normaliseTx(tx, addr, chain);
-  const normToken = (tx: BlockscoutTokenTransfer) => normaliseTokenTransfer(tx, addr, chain);
-
-  // First N ascending
-  const { results: firstNative, exhausted: nativeExhaustedFirst } =
-    await fetchNPages<BlockscoutTx>(
-      `${baseUrl}/addresses/${addr}/transactions?limit=100&sort=asc`,
-      firstCount, normTx,
-    );
-
-  const { results: firstTokens, exhausted: tokensExhaustedFirst } =
-    await fetchNPages<BlockscoutTokenTransfer>(
-      `${baseUrl}/addresses/${addr}/token-transfers?limit=100&type=ERC-20`,
-      firstCount, normToken,
-    );
-
-  // Last M descending (then reverse)
-  const { results: lastNativeRev, exhausted: nativeExhaustedLast } =
-    await fetchNPages<BlockscoutTx>(
-      `${baseUrl}/addresses/${addr}/transactions?limit=100&sort=desc`,
-      lastCount, normTx,
-    );
-  const lastNative = [...lastNativeRev].reverse();
-
-  const { results: lastTokensRev, exhausted: tokensExhaustedLast } =
-    await fetchNPages<BlockscoutTokenTransfer>(
-      `${baseUrl}/addresses/${addr}/token-transfers?limit=100&type=ERC-20&sort=desc`,
-      lastCount, normToken,
-    );
-  const lastTokens = [...lastTokensRev].reverse();
-
-  // Detect gap: latest block in first window < earliest block in last window
-  const allFirst = [...firstNative, ...firstTokens];
-  const allLast  = [...lastNative,  ...lastTokens];
-
-  const firstMaxBlock = allFirst.reduce<bigint | null>((m, tx) => m === null || tx.blockNumber > m ? tx.blockNumber : m, null);
-  const lastMinBlock  = allLast.reduce<bigint | null>((m, tx)  => m === null || tx.blockNumber < m ? tx.blockNumber : m, null);
-
-  const hasGap = firstMaxBlock !== null && lastMinBlock !== null && firstMaxBlock < lastMinBlock - 1n;
-
-  // Also partial if either window was capped (didn't exhaust the chain)
-  const windowCapped = (!nativeExhaustedFirst || !tokensExhaustedFirst) &&
-                       (!nativeExhaustedLast  || !tokensExhaustedLast);
-
-  const partial = hasGap || windowCapped;
-
-  if (partial) {
-    console.info(
-      `[BlockscoutFetcher:${chain}] partial scan for ${addr} — ` +
-      `gap=${hasGap}, capped=${windowCapped}. Queue deep_scan for full coverage.`,
-    );
-  }
-
-  const transactions = deduplicateTxs([...allFirst, ...allLast]);
-  return { transactions, partial };
-}
-
-// ---------------------------------------------------------------------------
-// Blockscout v2 — deep scan (all txs, slow, used overnight)
-// ---------------------------------------------------------------------------
-
-async function fetchBlockscoutAll(
-  baseUrl: string,
-  address: string,
-  chain: ChainSlug,
-  pageDelayMs: number,
-): Promise<{ transactions: RawTransaction[]; partial: false }> {
-  const addr = address.toLowerCase();
-  const results: RawTransaction[] = [];
-
-  let nativeUrl: string | null = `${baseUrl}/addresses/${addr}/transactions?limit=100&sort=asc`;
-  while (nativeUrl) {
-    try {
-      const { items, nextUrl }: { items: BlockscoutTx[]; nextUrl: string | null } = await fetchBlockscoutPage<BlockscoutTx>(nativeUrl);
-      results.push(...items.map((tx) => normaliseTx(tx, addr, chain)));
-      nativeUrl = nextUrl;
-      if (nativeUrl) await sleep(pageDelayMs);
-    } catch (err) {
-      console.warn(`[BlockscoutFetcher:${chain}] deep scan native page failed:`, err);
-      break;
-    }
-  }
-
-  let tokenUrl: string | null = `${baseUrl}/addresses/${addr}/token-transfers?limit=100&type=ERC-20`;
-  while (tokenUrl) {
-    try {
-      const { items, nextUrl }: { items: BlockscoutTokenTransfer[]; nextUrl: string | null } = await fetchBlockscoutPage<BlockscoutTokenTransfer>(tokenUrl);
-      results.push(...items.map((tx) => normaliseTokenTransfer(tx, addr, chain)));
-      tokenUrl = nextUrl;
-      if (tokenUrl) await sleep(pageDelayMs);
-    } catch (err) {
-      console.warn(`[BlockscoutFetcher:${chain}] deep scan token page failed:`, err);
-      break;
-    }
-  }
-
-  return { transactions: deduplicateTxs(results), partial: false };
-}
-
-// ---------------------------------------------------------------------------
-// Blockscout v2 — delta scan (only txs after fromBlock, ascending, capped at N pages)
-// ---------------------------------------------------------------------------
-
-async function fetchBlockscoutDelta(
-  baseUrl: string,
-  address: string,
-  chain: ChainSlug,
-  fromBlock: bigint,
-  maxPages: number,
-  pageDelayMs: number,
-): Promise<{ transactions: RawTransaction[]; partial: false }> {
-  const addr = address.toLowerCase();
-
-  async function fetchDeltaPages<T>(
-    startUrl: string,
-    normalise: (item: T) => RawTransaction,
-    getBlockNumber: (item: T) => bigint,
-  ): Promise<RawTransaction[]> {
-    const results: RawTransaction[] = [];
-    let url: string | null = startUrl;
-    let pages = 0;
-
-    while (url && pages < maxPages) {
-      try {
-        const { items, nextUrl }: { items: T[]; nextUrl: string | null } = await fetchBlockscoutPage<T>(url);
-        pages++;
-
-        // Filter: only keep items with blockNumber >= fromBlock
-        const newItems = items.filter((item) => getBlockNumber(item) >= fromBlock);
-        results.push(...newItems.map(normalise));
-
-        // If every item on the page is below fromBlock, we're done (ascending order,
-        // so nothing further back will be in range — but we're fetching ascending
-        // so items should be in increasing block order). Stop if page is entirely old.
-        if (items.length > 0 && items.every((item) => getBlockNumber(item) < fromBlock)) {
-          break;
-        }
-
-        url = nextUrl;
-        if (url) await sleep(pageDelayMs);
-      } catch (err) {
-        console.warn(`[BlockscoutFetcher:${chain}] delta page fetch failed:`, err);
-        break;
-      }
-    }
-
-    return results;
-  }
-
-  const normTx    = (tx: BlockscoutTx) => normaliseTx(tx, addr, chain);
-  const normToken = (tx: BlockscoutTokenTransfer) => normaliseTokenTransfer(tx, addr, chain);
-
-  const nativeTxs = await fetchDeltaPages<BlockscoutTx>(
-    `${baseUrl}/addresses/${addr}/transactions?limit=100&sort=asc`,
-    normTx,
-    (tx) => BigInt(tx.block_number ?? 0),
-  );
-
-  const tokenTxs = await fetchDeltaPages<BlockscoutTokenTransfer>(
-    `${baseUrl}/addresses/${addr}/token-transfers?limit=100&type=ERC-20&sort=asc`,
-    normToken,
-    (tx) => BigInt(tx.block_number ?? 0),
-  );
-
-  return { transactions: deduplicateTxs([...nativeTxs, ...tokenTxs]), partial: false };
-}
-
-// ---------------------------------------------------------------------------
-// Etherscan/Snowtrace fetcher (Avalanche)
-// ---------------------------------------------------------------------------
-
-interface EtherscanTx {
-  blockNumber: string;
-  timeStamp: string;
-  hash: string;
-  from: string;
-  to: string;
-  value: string;
-  isError: string;
-}
-
-interface EtherscanTokenTx {
-  blockNumber: string;
-  timeStamp: string;
-  hash: string;
-  from: string;
-  to: string;
-  value: string;
-  tokenSymbol: string;
-  contractAddress: string;
-}
-
-interface EtherscanResponse<T> {
-  status: string;
-  message: string;
-  result: T[] | string;
-}
-
-async function fetchEtherscanAllTxs(
-  baseUrl: string,
-  address: string,
-  chain: ChainSlug,
-  apiKey: string | undefined,
-  fromBlock?: bigint,
-): Promise<{ transactions: RawTransaction[]; partial: boolean }> {
-  const addr = address.toLowerCase();
-  const results: RawTransaction[] = [];
-
-  const buildUrl = (action: string): string => {
-    const params = new URLSearchParams({
-      module: 'account',
-      action,
-      address,
-      startblock: fromBlock !== undefined ? fromBlock.toString() : '0',
-      endblock: '99999999',
-      sort: 'asc',
-      offset: '10000',
-      page: '1',
-    });
-    if (apiKey) params.set('apikey', apiKey);
-    return `${baseUrl}?${params.toString()}`;
-  };
-
-  try {
-    const resp = await fetchWithRetry(buildUrl('txlist'), 3, 1000);
-    const data = (await resp.json()) as EtherscanResponse<EtherscanTx>;
-    if (data.status === '1' && Array.isArray(data.result)) {
-      for (const tx of data.result) {
-        if (tx.isError !== '0') continue;
-        results.push({
-          txHash: tx.hash,
-          fromAddress: tx.from.toLowerCase(),
-          toAddress: tx.to.toLowerCase(),
-          blockNumber: BigInt(tx.blockNumber),
-          blockTimestamp: new Date(Number(tx.timeStamp) * 1000),
-          valueWei: tx.value,
-          isInbound: tx.to.toLowerCase() === addr,
-          chain,
-        });
-      }
-    }
-  } catch (err) {
-    console.warn(`[EtherscanFetcher:${chain}] native tx fetch failed:`, err);
-  }
-
-  try {
-    const resp = await fetchWithRetry(buildUrl('tokentx'), 3, 1000);
-    const data = (await resp.json()) as EtherscanResponse<EtherscanTokenTx>;
-    if (data.status === '1' && Array.isArray(data.result)) {
-      for (const tx of data.result) {
-        results.push({
-          txHash: tx.hash,
-          fromAddress: tx.from.toLowerCase(),
-          toAddress: tx.to.toLowerCase(),
-          blockNumber: BigInt(tx.blockNumber),
-          blockTimestamp: new Date(Number(tx.timeStamp) * 1000),
-          valueWei: '0',
-          isInbound: tx.to.toLowerCase() === addr,
-          chain,
-          ...(tx.tokenSymbol ? { tokenSymbol: tx.tokenSymbol } : {}),
-          tokenContractAddress: tx.contractAddress.toLowerCase(),
-          tokenValueRaw: tx.value,
-        });
-      }
-    }
-  } catch (err) {
-    console.warn(`[EtherscanFetcher:${chain}] token tx fetch failed:`, err);
-  }
-
-  // Snowtrace caps at 10k via offset; mark partial if we hit that limit
-  const deduped = deduplicateTxs(results);
-  return { transactions: deduped, partial: deduped.length >= 10000 };
+  const response = await fetchWithRetry(url.toString());
+  return (await response.json()) as BlockscoutPage<T>;
 }
 
 // ---------------------------------------------------------------------------
@@ -493,71 +223,229 @@ async function fetchEtherscanAllTxs(
 
 export class WalletTransactionFetcher {
   private readonly chain: ChainSlug;
+  private readonly baseUrl: string;
 
   constructor(chain: ChainSlug) {
+    const config = BLOCKSCOUT_CONFIGS[chain];
+    if (!config) {
+      throw new Error(`WalletTransactionFetcher: no Blockscout config for chain "${chain}"`);
+    }
     this.chain = chain;
+    this.baseUrl = config.baseUrl;
   }
 
   /**
-   * Fetch transactions using the first+last window strategy:
-   *   - First SCAN_WINDOW_FIRST txs (asc) — early funding/sybil signals
-   *   - Last SCAN_WINDOW_LAST txs (desc reversed) — recent deposit/P2P activity
-   *   - Gap detection: if uncovered history exists, partial=true
-   *
-   * opts.deepScan=true: fetch ALL txs with DEEP_SCAN_PAGE_DELAY_MS between pages.
-   * Only used by overnight deep_scan jobs for flagged partial wallets.
-   *
-   * opts.fromBlock: fetch only transactions at or after this block number (delta scan).
-   * Skips the window strategy; fetches ascending from fromBlock up to
-   * SCAN_MAX_PAGES_DELTA pages. partial=false for delta scans.
+   * Fetch all (or windowed) transactions for a wallet address.
    */
-  async fetchAll(address: string, opts?: FetchOptions): Promise<FetchResult> {
+  async fetchAll(address: string, opts?: FetchAllOptions): Promise<FetchResult> {
     const addr = address.toLowerCase();
-    let fetchResult: { transactions: RawTransaction[]; partial: boolean };
 
-    if (this.chain in BLOCKSCOUT_CONFIGS) {
-      const { baseUrl } = BLOCKSCOUT_CONFIGS[this.chain]!;
-      if (opts?.fromBlock !== undefined) {
-        // Delta scan: fetch only new txs since fromBlock
-        fetchResult = await fetchBlockscoutDelta(
-          baseUrl, addr, this.chain,
-          opts.fromBlock,
-          env.SCAN_MAX_PAGES_DELTA,
-          50,
-        );
-      } else if (opts?.deepScan) {
-        fetchResult = await fetchBlockscoutAll(baseUrl, addr, this.chain, env.DEEP_SCAN_PAGE_DELAY_MS);
-      } else {
-        fetchResult = await fetchBlockscoutWindow(
-          baseUrl, addr, this.chain,
-          env.SCAN_WINDOW_FIRST,
-          env.SCAN_WINDOW_LAST,
-          50,
-        );
-      }
-    } else if (this.chain in ETHERSCAN_CONFIGS) {
-      const config = ETHERSCAN_CONFIGS[this.chain]!;
-      const apiKey = env[config.envKey as keyof typeof env] as string | undefined;
-      // Etherscan 10k cap is generous; deep_scan flag not needed for Avalanche
-      // fromBlock wired directly to startblock param
-      fetchResult = await fetchEtherscanAllTxs(config.baseUrl, addr, this.chain, apiKey, opts?.fromBlock);
-    } else {
-      throw new Error(`WalletTransactionFetcher: unsupported chain "${this.chain}"`);
+    if (opts?.fromBlock !== undefined) {
+      return this.fetchFromBlock(addr, opts.fromBlock);
     }
 
-    const { transactions, partial } = fetchResult;
-    const blockNumbers = transactions.map((t) => t.blockNumber);
-    const fromBlock = blockNumbers.length > 0 ? blockNumbers.reduce((a, b) => (a < b ? a : b)) : undefined;
-    const toBlock   = blockNumbers.length > 0 ? blockNumbers.reduce((a, b) => (a > b ? a : b)) : undefined;
+    if (opts?.deepScan) {
+      return this.fetchDeepScan(addr);
+    }
+
+    return this.fetchWindowed(addr);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Windowed fetch (default full scan)
+  // ---------------------------------------------------------------------------
+
+  private async fetchWindowed(addr: string): Promise<FetchResult> {
+    const windowFirst = env.SCAN_WINDOW_FIRST;
+    const windowLast = env.SCAN_WINDOW_LAST;
+
+    const fixedParamsAsc  = { sort: 'asc',  limit: '50' };
+    const fixedParamsDesc = { sort: 'desc', limit: '50' };
+
+    const [
+      { txs: nativeFirst,  exhausted: nativeExhaustedFirst },
+      { txs: tokensFirst,  exhausted: tokensExhaustedFirst },
+      { txs: nativeLast,   exhausted: nativeExhaustedLast  },
+      { txs: tokensLast,   exhausted: tokensExhaustedLast  },
+    ] = await Promise.all([
+      this.fetchNPages(addr, 'transactions',   fixedParamsAsc,  Math.ceil(windowFirst / 50)),
+      this.fetchNPages(addr, 'token-transfers', fixedParamsAsc,  Math.ceil(windowFirst / 50)),
+      this.fetchNPages(addr, 'transactions',   fixedParamsDesc, Math.ceil(windowLast  / 50)),
+      this.fetchNPages(addr, 'token-transfers', fixedParamsDesc, Math.ceil(windowLast  / 50)),
+    ]);
+
+    // H8 — a scan is partial if EITHER the first OR last window was capped
+    //      (was &&, now || — correct: partial if either window was truncated)
+    const windowCapped =
+      (!nativeExhaustedFirst || !tokensExhaustedFirst) ||
+      (!nativeExhaustedLast  || !tokensExhaustedLast);
+
+    const merged = this.dedup([...nativeFirst, ...tokensFirst, ...nativeLast, ...tokensLast]);
+
+    const toBlock =
+      merged.length > 0
+        ? merged.reduce((max, tx) => (tx.blockNumber > max ? tx.blockNumber : max), 0n)
+        : undefined;
 
     return {
-      transactions,
-      totalFetched: transactions.length,
-      partial,
+      transactions: merged,
+      totalFetched: merged.length,
       chain: this.chain,
       address: addr,
-      ...(fromBlock !== undefined ? { fromBlock } : {}),
-      ...(toBlock   !== undefined ? { toBlock   } : {}),
+      toBlock,
+      partial: windowCapped,
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Deep scan (all pages, no window limit)
+  // ---------------------------------------------------------------------------
+
+  private async fetchDeepScan(addr: string): Promise<FetchResult> {
+    const fixedParams = { sort: 'asc', limit: '50' };
+    const delayMs = env.DEEP_SCAN_PAGE_DELAY_MS;
+
+    const [{ txs: nativeTxs }, { txs: tokenTxs }] = await Promise.all([
+      this.fetchNPages(addr, 'transactions',   fixedParams, Infinity, delayMs),
+      this.fetchNPages(addr, 'token-transfers', fixedParams, Infinity, delayMs),
+    ]);
+
+    const merged = this.dedup([...nativeTxs, ...tokenTxs]);
+
+    const toBlock =
+      merged.length > 0
+        ? merged.reduce((max, tx) => (tx.blockNumber > max ? tx.blockNumber : max), 0n)
+        : undefined;
+
+    return {
+      transactions: merged,
+      totalFetched: merged.length,
+      chain: this.chain,
+      address: addr,
+      toBlock,
+      partial: false,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Delta fetch (from a specific block number)
+  // ---------------------------------------------------------------------------
+
+  private async fetchFromBlock(addr: string, fromBlock: bigint): Promise<FetchResult> {
+    const maxPages = env.SCAN_MAX_PAGES_DELTA;
+    const fixedParams = { sort: 'asc', limit: '50' };
+
+    const allTxs: RawTransaction[] = [];
+    let nativeNextPage: BlockscoutNextPage | null = null;
+    let tokenNextPage: BlockscoutNextPage | null = null;
+    let pages = 0;
+
+    while (pages < maxPages) {
+      const [nativePage, tokenPage] = await Promise.all([
+        fetchBlockscoutPage<BlockscoutTx>(
+          this.baseUrl, addr, 'transactions', fixedParams, nativeNextPage,
+        ),
+        fetchBlockscoutPage<BlockscoutTokenTransfer>(
+          this.baseUrl, addr, 'token-transfers', fixedParams, tokenNextPage,
+        ),
+      ]);
+
+      // C4 — only include confirmed transactions at or after fromBlock
+      const newNative = (nativePage.items ?? []).filter(
+        (item): item is BlockscoutTx & { block_number: number } =>
+          item.block_number !== null &&
+          item.block_number !== undefined &&
+          BigInt(item.block_number) >= fromBlock,
+      );
+      const newTokens = (tokenPage.items ?? []).filter(
+        (item): item is BlockscoutTokenTransfer & { block_number: number } =>
+          item.block_number !== null &&
+          item.block_number !== undefined &&
+          BigInt(item.block_number) >= fromBlock,
+      );
+
+      for (const item of newNative) {
+        const tx = normaliseTx(item, addr, this.chain);
+        if (tx) allTxs.push(tx);
+      }
+      for (const item of newTokens) {
+        const tx = normaliseTokenTransfer(item, addr, this.chain);
+        if (tx) allTxs.push(tx);
+      }
+
+      nativeNextPage = nativePage.next_page_params ?? null;
+      tokenNextPage = tokenPage.next_page_params ?? null;
+
+      if (!nativeNextPage && !tokenNextPage) break;
+      pages++;
+
+      if (pages < maxPages) await sleep(env.SCANNER_DELAY_MS);
+    }
+
+    const merged = this.dedup(allTxs);
+    const toBlock =
+      merged.length > 0
+        ? merged.reduce((max, tx) => (tx.blockNumber > max ? tx.blockNumber : max), 0n)
+        : undefined;
+
+    return {
+      transactions: merged,
+      totalFetched: merged.length,
+      chain: this.chain,
+      address: addr,
+      fromBlock,
+      toBlock,
+      partial: false,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  private async fetchNPages(
+    addr: string,
+    kind: 'transactions' | 'token-transfers',
+    fixedParams: Record<string, string>,
+    maxPages: number,
+    delayMs = env.SCANNER_DELAY_MS,
+  ): Promise<{ txs: RawTransaction[]; exhausted: boolean }> {
+    const txs: RawTransaction[] = [];
+    let nextPage: BlockscoutNextPage | null = null;
+    let pages = 0;
+
+    while (pages < maxPages) {
+      const page = await fetchBlockscoutPage<BlockscoutTx | BlockscoutTokenTransfer>(
+        this.baseUrl, addr, kind, fixedParams, nextPage,
+      );
+
+      for (const item of page.items ?? []) {
+        const tx =
+          kind === 'transactions'
+            ? normaliseTx(item as BlockscoutTx, addr, this.chain)
+            : normaliseTokenTransfer(item as BlockscoutTokenTransfer, addr, this.chain);
+
+        // C4 — filter out null (pending) transactions
+        if (tx !== null) txs.push(tx);
+      }
+
+      nextPage = page.next_page_params ?? null;
+
+      if (!nextPage) return { txs, exhausted: true };
+
+      pages++;
+      if (pages < maxPages) await sleep(delayMs);
+    }
+
+    return { txs, exhausted: false };
+  }
+
+  private dedup(txs: RawTransaction[]): RawTransaction[] {
+    const seen = new Set<string>();
+    return txs.filter((tx) => {
+      if (seen.has(tx.txHash)) return false;
+      seen.add(tx.txHash);
+      return true;
+    });
   }
 }

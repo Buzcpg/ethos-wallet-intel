@@ -1,6 +1,6 @@
-import { eq, and, isNull, lt, or, sql } from 'drizzle-orm';
+import { eq, and, isNull, lt, or, sql, count } from 'drizzle-orm';
 import { type Db, db as getDb } from '../db/client.js';
-import { wallets, firstFunderSignals } from '../db/schema/index.js';
+import { wallets } from '../db/schema/index.js';
 import type { ChainSlug } from '../chains/index.js';
 import { WalletTransactionFetcher } from '../chains/transactionFetcher.js';
 import { FirstFunderScanner } from './firstFunderScanner.js';
@@ -68,6 +68,7 @@ export class WalletScanner {
 
   /**
    * Full scan: fetch all transactions once, run all three extractors in parallel.
+   * Each extractor is idempotent (upserts/conflict handling), so repeated runs are safe.
    */
   async scanWallet(walletId: string, chain: ChainSlug, opts?: WalletScanOptions): Promise<WalletScanResult> {
     const startMs = Date.now();
@@ -90,49 +91,18 @@ export class WalletScanner {
           depositEvidenceFound: 0,
           p2pMatchesFound: 0,
           partial: false,
-        deepScanReasons: [],
-      durationMs: Date.now() - startMs,
+          deepScanReasons: [],
+          durationMs: Date.now() - startMs,
           error: `Wallet ${walletId} not found`,
         };
       }
 
-      // 2. Check if all signals already exist (first funder signal as proxy)
-      //    Full skip only if first-funder signal exists AND wallet has been scanned.
-      //    Deposit + P2P are idempotent internally, so we don't short-circuit them.
-      const existingSignal = await database
-        .select({ id: firstFunderSignals.id })
-        .from(firstFunderSignals)
-        .where(
-          and(
-            eq(firstFunderSignals.walletId, walletId),
-            eq(firstFunderSignals.chain, chain),
-          ),
-        )
-        .limit(1);
-
-      const alreadyFullyScanned =
-        existingSignal.length > 0 && wallet.lastScannedAt !== null;
-
-      if (alreadyFullyScanned) {
-        return {
-          walletId,
-          chain,
-          transactionsFetched: 0,
-          firstFunderFound: true,
-          depositEvidenceFound: 0,
-          p2pMatchesFound: 0,
-          partial: false,
-        deepScanReasons: [],
-      durationMs: Date.now() - startMs,
-        };
-      }
-
-      // 3. Fetch ALL transactions (single pass)
+      // 2. Fetch ALL transactions (single pass)
       const fetcher = new WalletTransactionFetcher(chain);
-      const fetchResult = await fetcher.fetchAll(wallet.address);
+      const fetchResult = await fetcher.fetchAll(wallet.address, opts?.deepScan ? { deepScan: true } : undefined);
       const { transactions } = fetchResult;
 
-      // 4. Run all three extractors in parallel on the same data
+      // 3. Run all three extractors in parallel on the same data
       const [firstFunderResult, depositResult, p2pResult] = await Promise.all([
         this.firstFunderScanner
           .extractFromTransactions(walletId, wallet.address, transactions, chain)
@@ -154,7 +124,7 @@ export class WalletScanner {
           }),
       ]);
 
-      // 5. Update wallet scan state
+      // 4. Update wallet scan state
       //    (firstFunderScanner.extractFromTransactions already updates lastScannedAt,
       //     but we ensure it's set even if first funder wasn't found)
       await database
@@ -425,8 +395,6 @@ export class WalletScanner {
         results.push(result);
         if (result.error) {
           errors++;
-        } else if (result.transactionsFetched === 0 && result.firstFunderFound) {
-          skipped++; // already fully scanned
         } else {
           scanned++;
         }
@@ -489,5 +457,29 @@ export class WalletScanner {
       .limit(limit);
 
     return rows.map((r) => r.id);
+  }
+
+  /**
+   * Count wallets due for rescan on this chain using SELECT COUNT(*).
+   * More efficient than getWalletsDueForRescan when only the count is needed (M5).
+   */
+  async countWalletsDueForRescan(chain: ChainSlug, intervalHours: number): Promise<number> {
+    const database = this.getDbFn();
+    const cutoff = new Date(Date.now() - intervalHours * 60 * 60 * 1000);
+
+    const result = await database
+      .select({ value: count() })
+      .from(wallets)
+      .where(
+        and(
+          eq(wallets.chain, chain),
+          or(
+            isNull(wallets.lastScannedAt),
+            lt(wallets.lastScannedAt, cutoff),
+          ),
+        ),
+      );
+
+    return result[0]?.value ?? 0;
   }
 }

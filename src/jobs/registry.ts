@@ -6,6 +6,7 @@ import { FirstFunderScanner } from '../scanner/firstFunderScanner.js';
 import { FirstFunderMatcher } from '../matcher/firstFunderMatcher.js';
 import { LabelResolver } from '../labels/labelResolver.js';
 import { isValidChain } from '../chains/index.js';
+import { markFailed } from '../queue/index.js';
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -98,8 +99,14 @@ export const jobRegistry: Record<JobType, JobHandler> = {
    * Only queued for wallets where a previous scan returned partial=true.
    */
   deep_scan: async (job) => {
-    if (!job.walletId || !job.chain) {
-      console.warn('[deep_scan] invalid job, skipping');
+    if (!job.walletId) {
+      console.warn('[deep_scan] Job missing walletId, skipping');
+      return;
+    }
+    // H9 — validate chain before proceeding (matches pattern of all other handlers)
+    if (!isValidChain(job.chain)) {
+      console.warn(`[deep_scan] Invalid chain "${job.chain}", marking job failed`);
+      await markFailed(job.id, `Invalid chain: ${job.chain}`);
       return;
     }
     console.log(`[deep_scan] full tx history — wallet ${job.walletId} on ${job.chain}`);
@@ -107,3 +114,8 @@ export const jobRegistry: Record<JobType, JobHandler> = {
     await scanner.scanWallet(job.walletId, job.chain as ChainSlug, { deepScan: true });
   },
 };
+
+// Suppress unused-import warning for LabelResolver and FirstFunderScanner
+// — these are available to handlers but only instantiated on demand.
+void (LabelResolver as unknown);
+void (FirstFunderScanner as unknown);

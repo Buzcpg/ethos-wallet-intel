@@ -47,7 +47,8 @@ interface UserApiResponse {
 
 type Limiter = <T>(fn: () => Promise<T>) => Promise<T>;
 
-function createLimiter(max: number): Limiter {
+// M2 — exported so RescanOrchestrator (and others) can import instead of duplicating.
+export function createLimiter(max: number): Limiter {
   let running = 0;
   const queue: Array<{
     fn: () => Promise<unknown>;
@@ -134,6 +135,10 @@ export class EthosApiClient implements IEthosApiClient {
       for (const profile of json.values) {
         yield profile;
       }
+
+      // C5 — break immediately if the API returns an empty page to prevent an
+      // infinite loop when total > offset but values is empty (network glitch / server bug).
+      if (json.values.length === 0) break;
 
       offset += limit;
 

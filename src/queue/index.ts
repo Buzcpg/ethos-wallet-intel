@@ -2,10 +2,12 @@ import { eq, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { walletScanJobs } from '../db/schema/index.js';
 import type { JobType, EnqueueJobOptions, WalletScanJob } from '../jobs/types.js';
+import type { ChainSlug } from '../chains/index.js';
 
+// L7 — chain param typed as ChainSlug instead of string for type safety at call sites.
 export async function enqueueJob(
   walletId: string,
-  chain: string,
+  chain: ChainSlug,
   jobType: JobType,
   options: EnqueueJobOptions = {},
 ): Promise<WalletScanJob> {
@@ -94,4 +96,24 @@ export async function getQueueCounts(): Promise<{ pending: number; running: numb
     if (r.status === 'failed') counts.failed = parseInt(r.count, 10);
   }
   return counts;
+}
+
+/**
+ * C3 — Reset stale running jobs back to pending.
+ * Any job in status='running' with started_at older than timeoutMs is reset.
+ * Call at worker startup and periodically to recover from worker crashes.
+ * Returns the number of jobs reset.
+ */
+export async function resetStaleJobs(timeoutMs: number): Promise<number> {
+  const cutoff = new Date(Date.now() - timeoutMs);
+  const result = await db().execute<{ id: string }>(sql`
+    UPDATE wallet_scan_jobs
+    SET status = 'pending',
+        started_at = null,
+        updated_at = now()
+    WHERE status = 'running'
+      AND started_at < ${cutoff}
+    RETURNING id
+  `);
+  return result.rows.length;
 }
