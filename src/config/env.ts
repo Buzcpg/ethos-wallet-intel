@@ -19,6 +19,8 @@ const envSchema = z.object({
   ETHERSCAN_API_KEY: z.string().optional(),
   POLYGONSCAN_API_KEY: z.string().optional(),
   SNOWTRACE_API_KEY: z.string().optional(),
+  // Blockscout Pro API key (api.blockscout.com multichain — activate if plan upgrades from free tier)
+  BLOCKSCOUT_PRO_API_KEY: z.string().optional(),
   // Supabase — profile ID enumeration (faster than Ethos API pagination)
   SUPABASE_URL: z.string().url().optional(),
   SUPABASE_ANON_KEY: z.string().optional(),
