@@ -38,7 +38,13 @@ async function fetchWithRetry(url: string, retries = 3, backoffMs = 1000): Promi
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const response = await fetch(url);
-      return response;
+      if (response.ok) return response;
+      if (response.status === 429) {
+        // Rate limited — back off and retry
+        await sleep(backoffMs * (attempt + 1));
+        continue;
+      }
+      throw new Error(`Etherscan API returned ${response.status}`);
     } catch (err) {
       lastErr = err;
       if (attempt < retries - 1) {
