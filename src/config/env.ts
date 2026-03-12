@@ -21,6 +21,8 @@ const envSchema = z.object({
   SNOWTRACE_API_KEY: z.string().optional(),
   // Blockscout Pro API key (api.blockscout.com multichain — activate if plan upgrades from free tier)
   BLOCKSCOUT_PRO_API_KEY: z.string().optional(),
+  // Comma-separated chain slugs to skip in dequeue (e.g. 'avalanche' during peak hours)
+  SKIP_CHAINS: z.string().optional(),
   // Supabase — profile ID enumeration (faster than Ethos API pagination)
   SUPABASE_URL: z.string().url().optional(),
   SUPABASE_ANON_KEY: z.string().optional(),
