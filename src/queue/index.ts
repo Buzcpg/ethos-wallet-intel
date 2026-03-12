@@ -128,3 +128,34 @@ export async function resetStaleJobs(staleTimeoutMs: number): Promise<number> {
 
   return result.rowCount ?? 0;
 }
+
+export async function getQueueCounts(): Promise<{
+  pending: number;
+  running: number;
+  done: number;
+  failed: number;
+}> {
+  const result = await getDb()
+    .select({
+      status: walletScanJobs.status,
+      count: sql<number>`count(*)`.mapWith(Number),
+    })
+    .from(walletScanJobs)
+    .groupBy(walletScanJobs.status);
+
+  const counts = {
+    pending: 0,
+    running: 0,
+    done: 0,
+    failed: 0,
+  };
+
+  for (const row of result) {
+    if (row.status === 'pending') counts.pending = row.count;
+    if (row.status === 'running') counts.running = row.count;
+    if (row.status === 'done') counts.done = row.count;
+    if (row.status === 'failed') counts.failed = row.count;
+  }
+
+  return counts;
+}
