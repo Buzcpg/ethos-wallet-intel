@@ -112,7 +112,7 @@ export class RescanOrchestrator {
     // profiles_v2 table instead of probing blindly. Supabase PostgREST supports
     // ?raw_profile_id=gt.{N}&select=raw_profile_id&order=raw_profile_id.asc
     if (env.SUPABASE_URL && env.SUPABASE_ANON_KEY) {
-      return this.syncNewProfilesViaSupabase(ethosClient, highestSeen);
+      return this.syncNewProfilesViaSupabase(highestSeen);
     }
 
     const maxMisses = env.NEW_USER_PROBE_MAX_MISSES;
@@ -194,7 +194,6 @@ export class RescanOrchestrator {
    * Exact IDs — no probe, no misses, no waste.
    */
   private async syncNewProfilesViaSupabase(
-    ethosClient: EthosApiClient,
     highestSeen: number,
   ): Promise<{ newProfiles: number; newWallets: number; jobsEnqueued: number; highestIdProbed: number }> {
     const pageSize = 1000;
@@ -228,14 +227,16 @@ export class RescanOrchestrator {
       const rows = await res.json() as Array<{ raw_profile_id: number }>;
       if (rows.length === 0) break;
 
+      // IDs are exact from Supabase — syncProfile fetches addresses internally.
+      // No interim getProfileAddresses() call needed.
       for (const { raw_profile_id } of rows) {
         highestIdProbed = Math.max(highestIdProbed, raw_profile_id);
         try {
-          const data = await ethosClient.getProfileAddresses(raw_profile_id);
-          if (!data || data.allAddresses.length === 0) continue;
-          await this.profileSync.syncProfile(raw_profile_id);
-          newProfiles++;
-          newWallets += data.allAddresses.length * 6;
+          const stats = await this.profileSync.syncProfile(raw_profile_id);
+          if (stats.walletsUpserted > 0) {
+            newProfiles++;
+            newWallets += stats.walletsUpserted;
+          }
         } catch (err) {
           console.warn(`[RescanOrchestrator] failed to sync profile ${raw_profile_id}:`, err);
         }
