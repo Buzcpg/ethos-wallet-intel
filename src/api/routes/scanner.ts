@@ -147,15 +147,22 @@ scanner.get('/deposit-stats', async (c) => {
     return parseInt(result.rows[0]?.count ?? '0', 10);
   };
 
-  const chains: Record<string, { depositEvidenceCount: number }> = {};
-  for (const chain of CHAIN_SLUGS) {
-    const count = await countRows(
-      sql`SELECT count(*)::text AS count FROM ${depositTransferEvidence} WHERE chain = ${chain}`,
+  try {
+    const chains: Record<string, { depositEvidenceCount: number }> = {};
+    await Promise.all(
+      CHAIN_SLUGS.map(async (chain) => {
+        const count = await countRows(
+          sql`SELECT count(*)::text AS count FROM ${depositTransferEvidence} WHERE chain = ${chain}`,
+        );
+        chains[chain] = { depositEvidenceCount: count };
+      }),
     );
-    chains[chain] = { depositEvidenceCount: count };
+    return c.json({ chains });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[scanner] deposit-stats failed:', err);
+    return c.json({ error: 'Failed to fetch deposit stats', details: message }, 500);
   }
-
-  return c.json({ chains });
 });
 
 // GET /scanner/p2p-stats
@@ -167,15 +174,22 @@ scanner.get('/p2p-stats', async (c) => {
     return parseInt(result.rows[0]?.count ?? '0', 10);
   };
 
-  const chains: Record<string, { p2pMatchCount: number }> = {};
-  for (const chain of CHAIN_SLUGS) {
-    const count = await countRows(
-      sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain} AND match_type = 'direct_wallet_interaction'`,
+  try {
+    const chains: Record<string, { p2pMatchCount: number }> = {};
+    await Promise.all(
+      CHAIN_SLUGS.map(async (chain) => {
+        const count = await countRows(
+          sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain} AND match_type = 'direct_wallet_interaction'`,
+        );
+        chains[chain] = { p2pMatchCount: count };
+      }),
     );
-    chains[chain] = { p2pMatchCount: count };
+    return c.json({ chains });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[scanner] p2p-stats failed:', err);
+    return c.json({ error: 'Failed to fetch p2p stats', details: message }, 500);
   }
-
-  return c.json({ chains });
 });
 
 // ---------------------------------------------------------------------------
@@ -184,9 +198,15 @@ scanner.get('/p2p-stats', async (c) => {
 
 // POST /labels/seed
 scanner.post('/labels/seed', async (c) => {
-  const resolver = new LabelResolver();
-  await resolver.seedFromStaticList();
-  return c.json({ success: true, message: 'Label seed complete (idempotent)' });
+  try {
+    const resolver = new LabelResolver();
+    await resolver.seedFromStaticList();
+    return c.json({ success: true, message: 'Label seed complete (idempotent)' });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[scanner] label seed failed:', err);
+    return c.json({ error: 'Label seed failed', details: message }, 500);
+  }
 });
 
 // POST /labels/resolve
@@ -197,12 +217,18 @@ scanner.post('/labels/resolve', async (c) => {
     return c.json({ error: 'Invalid request', details: parsed.error.flatten() }, 400);
   }
   const { address, chain } = parsed.data;
-  const resolver = new LabelResolver();
-  const label = await resolver.resolveLabel(address, chain as ChainSlug);
-  if (!label) {
-    return c.json({ address, chain, label: null });
+  try {
+    const resolver = new LabelResolver();
+    const label = await resolver.resolveLabel(address, chain as ChainSlug);
+    if (!label) {
+      return c.json({ address, chain, label: null });
+    }
+    return c.json({ address, chain, label });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[scanner] label resolve failed:', err);
+    return c.json({ error: 'Label resolution failed', details: message }, 500);
   }
-  return c.json({ address, chain, label });
 });
 
 // ---------------------------------------------------------------------------
@@ -218,48 +244,58 @@ scanner.get('/stats', async (c) => {
     return parseInt(result.rows[0]?.count ?? '0', 10);
   };
 
-  const chains: Record<
-    string,
-    {
-      totalWallets: number;
-      scanned: number;
-      withFirstFunder: number;
-      matches: number;
-      depositEvidence: number;
-      p2pMatches: number;
-    }
-  > = {};
+  try {
+    const chains: Record<
+      string,
+      {
+        totalWallets: number;
+        scanned: number;
+        withFirstFunder: number;
+        matches: number;
+        depositEvidence: number;
+        p2pMatches: number;
+      }
+    > = {};
 
-  for (const chain of CHAIN_SLUGS) {
-    const [total, scanned, withFirstFunder, matches, depositEvidenceCount, p2pMatchCount] =
-      await Promise.all([
-        countRows(sql`SELECT count(*)::text AS count FROM ${wallets} WHERE chain = ${chain}`),
-        countRows(
-          sql`SELECT count(*)::text AS count FROM ${wallets} WHERE chain = ${chain} AND last_scanned_at IS NOT NULL`,
-        ),
-        countRows(
-          sql`SELECT count(*)::text AS count FROM ${firstFunderSignals} WHERE chain = ${chain}`,
-        ),
-        countRows(sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain}`),
-        countRows(
-          sql`SELECT count(*)::text AS count FROM ${depositTransferEvidence} WHERE chain = ${chain}`,
-        ),
-        countRows(
-          sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain} AND match_type = 'direct_wallet_interaction'`,
-        ),
-      ]);
+    await Promise.all(
+      CHAIN_SLUGS.map(async (chain) => {
+        const [total, scanned, withFirstFunder, matches, depositEvidenceCount, p2pMatchCount] =
+          await Promise.all([
+            countRows(sql`SELECT count(*)::text AS count FROM ${wallets} WHERE chain = ${chain}`),
+            countRows(
+              sql`SELECT count(*)::text AS count FROM ${wallets} WHERE chain = ${chain} AND last_scanned_at IS NOT NULL`,
+            ),
+            countRows(
+              sql`SELECT count(*)::text AS count FROM ${firstFunderSignals} WHERE chain = ${chain}`,
+            ),
+            countRows(
+              sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain}`,
+            ),
+            countRows(
+              sql`SELECT count(*)::text AS count FROM ${depositTransferEvidence} WHERE chain = ${chain}`,
+            ),
+            countRows(
+              sql`SELECT count(*)::text AS count FROM ${walletMatches} WHERE chain = ${chain} AND match_type = 'direct_wallet_interaction'`,
+            ),
+          ]);
 
-    chains[chain] = {
-      totalWallets: total,
-      scanned,
-      withFirstFunder,
-      matches,
-      depositEvidence: depositEvidenceCount,
-      p2pMatches: p2pMatchCount,
-    };
+        chains[chain] = {
+          totalWallets: total,
+          scanned,
+          withFirstFunder,
+          matches,
+          depositEvidence: depositEvidenceCount,
+          p2pMatches: p2pMatchCount,
+        };
+      }),
+    );
+
+    return c.json({ chains });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[scanner] stats failed:', err);
+    return c.json({ error: 'Failed to fetch stats', details: message }, 500);
   }
-
-  return c.json({ chains });
 });
 
 export default scanner;
