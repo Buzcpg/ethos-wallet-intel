@@ -108,6 +108,13 @@ export class RescanOrchestrator {
 
     console.info(`[RescanOrchestrator] syncNewProfiles: probing from profile ID ${highestSeen + 1}`);
 
+    // Fast path: if Supabase creds are available, fetch exact new profile IDs from
+    // profiles_v2 table instead of probing blindly. Supabase PostgREST supports
+    // ?raw_profile_id=gt.{N}&select=raw_profile_id&order=raw_profile_id.asc
+    if (env.SUPABASE_URL && env.SUPABASE_ANON_KEY) {
+      return this.syncNewProfilesViaSupabase(ethosClient, highestSeen);
+    }
+
     const maxMisses = env.NEW_USER_PROBE_MAX_MISSES;
     const concurrency = env.ETHOS_API_CONCURRENCY;
     let consecutiveMisses = 0;
@@ -179,6 +186,69 @@ export class RescanOrchestrator {
       jobsEnqueued: newProfiles, // new_user jobs auto-enqueued by ProfileSyncService
       highestIdProbed,
     };
+  }
+
+  /**
+   * Supabase fast-path: fetch new profile IDs from profiles_v2 table
+   * using PostgREST filter (raw_profile_id > highestSeen).
+   * Exact IDs — no probe, no misses, no waste.
+   */
+  private async syncNewProfilesViaSupabase(
+    ethosClient: EthosApiClient,
+    highestSeen: number,
+  ): Promise<{ newProfiles: number; newWallets: number; jobsEnqueued: number; highestIdProbed: number }> {
+    const pageSize = 1000;
+    let offset = 0;
+    let newProfiles = 0;
+    let newWallets = 0;
+    let highestIdProbed = highestSeen;
+
+    console.info(`[RescanOrchestrator] syncNewProfiles: Supabase fast-path from ID ${highestSeen + 1}`);
+
+    while (true) {
+      const url = new URL(`${env.SUPABASE_URL}/rest/v1/profiles_v2`);
+      url.searchParams.set('select', 'raw_profile_id');
+      url.searchParams.set('raw_profile_id', `gt.${highestSeen}`);
+      url.searchParams.set('order', 'raw_profile_id.asc');
+      url.searchParams.set('limit', String(pageSize));
+      url.searchParams.set('offset', String(offset));
+
+      const res = await fetch(url.toString(), {
+        headers: {
+          'apikey': env.SUPABASE_ANON_KEY!,
+          'Authorization': `Bearer ${env.SUPABASE_ANON_KEY}`,
+        },
+      });
+
+      if (!res.ok) {
+        console.warn(`[RescanOrchestrator] Supabase fetch failed: ${res.status} ${res.statusText}`);
+        break;
+      }
+
+      const rows = await res.json() as Array<{ raw_profile_id: number }>;
+      if (rows.length === 0) break;
+
+      for (const { raw_profile_id } of rows) {
+        highestIdProbed = Math.max(highestIdProbed, raw_profile_id);
+        try {
+          const data = await ethosClient.getProfileAddresses(raw_profile_id);
+          if (!data || data.allAddresses.length === 0) continue;
+          await this.profileSync.syncProfile(raw_profile_id);
+          newProfiles++;
+          newWallets += data.allAddresses.length * 6;
+        } catch (err) {
+          console.warn(`[RescanOrchestrator] failed to sync profile ${raw_profile_id}:`, err);
+        }
+      }
+
+      if (rows.length < pageSize) break;
+      offset += pageSize;
+    }
+
+    console.info(
+      `[RescanOrchestrator] syncNewProfiles (Supabase): found ${newProfiles} new profiles, highest ID: ${highestIdProbed}`
+    );
+    return { newProfiles, newWallets, jobsEnqueued: newProfiles, highestIdProbed };
   }
 
   /**

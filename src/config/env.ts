@@ -17,6 +17,9 @@ const envSchema = z.object({
   ETHERSCAN_API_KEY: z.string().optional(),
   POLYGONSCAN_API_KEY: z.string().optional(),
   SNOWTRACE_API_KEY: z.string().optional(),
+  // Supabase — profile ID enumeration (faster than Ethos API pagination)
+  SUPABASE_URL: z.string().url().optional(),
+  SUPABASE_ANON_KEY: z.string().optional(),
   // Scanner settings
   SCANNER_CONCURRENCY: z.coerce.number().int().positive().default(5),
   SCANNER_DELAY_MS: z.coerce.number().int().nonnegative().default(200),
