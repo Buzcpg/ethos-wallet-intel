@@ -67,6 +67,15 @@ function mapRawJobRow(row: RawJobRow): WalletScanJob {
 }
 
 export async function dequeueNext(): Promise<WalletScanJob | null> {
+  // Build chain exclusion clause from SKIP_CHAINS env var
+  const skipChains = env.SKIP_CHAINS
+    ? env.SKIP_CHAINS.split(',').map(c => c.trim()).filter(Boolean)
+    : [];
+
+  const chainFilter = skipChains.length > 0
+    ? sql`AND chain NOT IN (${sql.raw(skipChains.map(c => `'${c}'`).join(', '))})`
+    : sql``;
+
   const result = await getDb().execute<RawJobRow>(sql`
     UPDATE wallet_scan_jobs
     SET status = 'running',
@@ -75,6 +84,7 @@ export async function dequeueNext(): Promise<WalletScanJob | null> {
     WHERE id = (
       SELECT id FROM wallet_scan_jobs
       WHERE status = 'pending'
+      ${chainFilter}
       ORDER BY created_at ASC
       LIMIT 1
       FOR UPDATE SKIP LOCKED
