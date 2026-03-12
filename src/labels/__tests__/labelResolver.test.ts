@@ -35,9 +35,26 @@ function makeMockDb(storedLabels: LabelRow[] = []) {
     }),
 
     insert: (_table: unknown) => ({
-      values: (vals: Record<string, unknown>) => {
-        labels.push(vals as unknown as LabelRow);
-        return Promise.resolve();
+      values: (vals: unknown) => {
+        // Support both single-object inserts (cacheLabel) and array inserts (seedFromStaticList)
+        const items: LabelRow[] = Array.isArray(vals)
+          ? (vals as LabelRow[])
+          : [vals as LabelRow];
+
+        for (const item of items) {
+          // Simulate ON CONFLICT DO NOTHING on (chain, address)
+          const isDuplicate = labels.some(
+            (l) => l.address === item.address && l.chain === item.chain,
+          );
+          if (!isDuplicate) {
+            labels.push(item);
+          }
+        }
+
+        return {
+          // Support .onConflictDoNothing() chained after .values() for batch inserts
+          onConflictDoNothing: () => Promise.resolve(),
+        };
       },
     }),
   };

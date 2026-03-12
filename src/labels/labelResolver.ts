@@ -106,28 +106,28 @@ export class LabelResolver {
    * Seed the DB from CEX_SEED_LABELS (idempotent).
    * Safe to call at startup — uses ON CONFLICT DO NOTHING via upsert.
    */
+  /**
+   * Seed the DB from CEX_SEED_LABELS (idempotent).
+   * Uses a single batch INSERT … ON CONFLICT DO NOTHING to replace the
+   * previous N*2 round-trip loop.
+   */
   async seedFromStaticList(): Promise<void> {
+    if (CEX_SEED_LABELS.length === 0) return;
     const database = this.getDbFn();
 
-    for (const seed of CEX_SEED_LABELS) {
-      const addr = seed.address.toLowerCase();
-      const existing = await database
-        .select({ id: addressLabels.id })
-        .from(addressLabels)
-        .where(and(eq(addressLabels.address, addr), eq(addressLabels.chain, seed.chain)))
-        .limit(1);
-
-      if (existing.length === 0) {
-        await database.insert(addressLabels).values({
+    await database
+      .insert(addressLabels)
+      .values(
+        CEX_SEED_LABELS.map((seed) => ({
           chain: seed.chain,
-          address: addr,
+          address: seed.address.toLowerCase(),
           labelValue: seed.label,
           labelKind: seed.kind,
-          source: 'seed_list',
+          source: 'seed_list' as const,
           confidence: '1.0',
-        });
-      }
-    }
+        })),
+      )
+      .onConflictDoNothing();
   }
 
   /**
