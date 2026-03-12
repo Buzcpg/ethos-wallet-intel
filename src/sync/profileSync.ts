@@ -143,7 +143,7 @@ export class ProfileSyncService {
     }
   }
 
-  private async upsertProfiles(batch: EthosProfile[]): Promise<void> {
+  async upsertProfiles(batch: EthosProfile[]): Promise<void> {
     const database = this.getDbFn();
 
     for (const profile of batch) {
@@ -167,7 +167,7 @@ export class ProfileSyncService {
     }
   }
 
-  private async getInternalProfileId(externalId: string): Promise<string | null> {
+  async getInternalProfileId(externalId: string): Promise<string | null> {
     const database = this.getDbFn();
     const [row] = await database
       .select({ id: profiles.id })
@@ -190,7 +190,7 @@ export class ProfileSyncService {
   async upsertWallets(
     internalProfileId: string,
     addressData: EthosAddressData,
-    source: 'ethos_api',
+    source: 'ethos_api' | 'supabase',
   ): Promise<number> {
     const database = this.getDbFn();
     const { primaryAddress, allAddresses } = addressData;

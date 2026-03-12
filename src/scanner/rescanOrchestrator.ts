@@ -5,6 +5,7 @@ import { WalletScanner } from './walletScanner.js';
 import { env } from '../config/env.js';
 import { enqueueJob } from '../queue/index.js';
 import { ProfileSyncService } from '../sync/profileSync.js';
+import { SupabaseSync, type SupabaseProfileRow } from '../sync/supabaseSync.js';
 import { EthosApiClient } from '../ethos/client.js';
 import { sql } from 'drizzle-orm';
 import { profiles } from '../db/schema/index.js';
@@ -17,11 +18,13 @@ export class RescanOrchestrator {
   private readonly getDbFn: () => Db;
   private readonly walletScanner: WalletScanner;
   private readonly profileSync: ProfileSyncService;
+  private readonly supabaseSync: SupabaseSync;
 
   constructor(dbFn?: () => Db) {
     this.getDbFn = dbFn ?? getDb;
     this.walletScanner = new WalletScanner(dbFn);
     this.profileSync = new ProfileSyncService(undefined, dbFn);
+    this.supabaseSync = new SupabaseSync(this.profileSync, dbFn);
   }
 
   /**
@@ -193,6 +196,16 @@ export class RescanOrchestrator {
    * using PostgREST filter (raw_profile_id > highestSeen).
    * Exact IDs — no probe, no misses, no waste.
    */
+  /**
+   * Supabase fast-path for new profile discovery.
+   *
+   * Fetches profiles_v2 rows with raw_profile_id > highestSeen, including
+   * userkeys (wallet addresses). Passes rows directly to SupabaseSync.ingestBatch —
+   * no Ethos API calls needed at all.
+   *
+   * Returns counts of new profiles, new wallets, and jobs enqueued.
+   * new_user scan jobs are auto-enqueued by upsertWallets for genuinely new wallets.
+   */
   private async syncNewProfilesViaSupabase(
     highestSeen: number,
   ): Promise<{ newProfiles: number; newWallets: number; jobsEnqueued: number; highestIdProbed: number }> {
@@ -206,7 +219,10 @@ export class RescanOrchestrator {
 
     while (true) {
       const url = new URL(`${env.SUPABASE_URL}/rest/v1/profiles_v2`);
-      url.searchParams.set('select', 'raw_profile_id');
+      url.searchParams.set(
+        'select',
+        'raw_profile_id,display_name,username,status,score,userkeys',
+      );
       url.searchParams.set('raw_profile_id', `gt.${highestSeen}`);
       url.searchParams.set('order', 'raw_profile_id.asc');
       url.searchParams.set('limit', String(pageSize));
@@ -214,8 +230,8 @@ export class RescanOrchestrator {
 
       const res = await fetch(url.toString(), {
         headers: {
-          'apikey': env.SUPABASE_ANON_KEY!,
-          'Authorization': `Bearer ${env.SUPABASE_ANON_KEY}`,
+          apikey: env.SUPABASE_ANON_KEY!,
+          Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
         },
       });
 
@@ -224,30 +240,23 @@ export class RescanOrchestrator {
         break;
       }
 
-      const rows = await res.json() as Array<{ raw_profile_id: number }>;
+      const rows = (await res.json()) as SupabaseProfileRow[];
       if (rows.length === 0) break;
 
-      // IDs are exact from Supabase — syncProfile fetches addresses internally.
-      // No interim getProfileAddresses() call needed.
-      for (const { raw_profile_id } of rows) {
-        highestIdProbed = Math.max(highestIdProbed, raw_profile_id);
-        try {
-          const stats = await this.profileSync.syncProfile(raw_profile_id);
-          if (stats.walletsUpserted > 0) {
-            newProfiles++;
-            newWallets += stats.walletsUpserted;
-          }
-        } catch (err) {
-          console.warn(`[RescanOrchestrator] failed to sync profile ${raw_profile_id}:`, err);
-        }
-      }
+      highestIdProbed = Math.max(highestIdProbed, ...rows.map((r) => r.raw_profile_id));
+
+      // Ingest via SupabaseSync — no Ethos API calls, addresses come from userkeys
+      const batchStats = await this.supabaseSync.ingestBatch(rows);
+      newProfiles += batchStats.profilesUpserted;
+      newWallets += batchStats.walletsUpserted;
 
       if (rows.length < pageSize) break;
       offset += pageSize;
     }
 
     console.info(
-      `[RescanOrchestrator] syncNewProfiles (Supabase): found ${newProfiles} new profiles, highest ID: ${highestIdProbed}`
+      `[RescanOrchestrator] syncNewProfiles (Supabase): ` +
+        `found ${newProfiles} new profiles, highest ID: ${highestIdProbed}`,
     );
     return { newProfiles, newWallets, jobsEnqueued: newProfiles, highestIdProbed };
   }
