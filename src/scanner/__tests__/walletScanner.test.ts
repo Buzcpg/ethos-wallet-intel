@@ -186,7 +186,10 @@ describe('WalletScanner', () => {
     expect(result.p2pMatchesFound).toBe(1);
   });
 
-  it('skips fetch when wallet is already fully scanned', async () => {
+  it('always runs all extractors even when wallet was previously scanned (C1 fix)', async () => {
+    // After C1 fix the alreadyFullyScanned early-exit is removed.
+    // scanWallet must always fetch + run all three extractors so that deposit/P2P
+    // data is never permanently skipped on wallets whose first scan partially failed.
     const db = makeMockDb({
       walletFound: true,
       lastScannedAt: new Date(),
@@ -196,9 +199,13 @@ describe('WalletScanner', () => {
 
     const result = await walletScanner.scanWallet(WALLET_ID, CHAIN);
 
-    expect(mockFetcher.fetchAll).not.toHaveBeenCalled();
+    // fetchAll and all three extractors MUST have been called
+    expect(mockFetcher.fetchAll).toHaveBeenCalledOnce();
+    expect(mockFirstFunder.extractFromTransactions).toHaveBeenCalledOnce();
+    expect(mockDeposit.scanTransactions).toHaveBeenCalledOnce();
+    expect(mockP2P.scanTransactions).toHaveBeenCalledOnce();
     expect(result.firstFunderFound).toBe(true);
-    expect(result.transactionsFetched).toBe(0);
+    expect(result.depositEvidenceFound).toBe(2);
   });
 
   it('marks wallet as scanned after completion', async () => {
