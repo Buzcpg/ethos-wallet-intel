@@ -292,7 +292,7 @@ export class WalletTransactionFetcher {
       totalFetched: merged.length,
       chain: this.chain,
       address: addr,
-      toBlock,
+      ...(toBlock !== undefined ? { toBlock } : {}),
       partial: windowCapped,
     };
   }
@@ -322,7 +322,7 @@ export class WalletTransactionFetcher {
       totalFetched: merged.length,
       chain: this.chain,
       address: addr,
-      toBlock,
+      ...(toBlock !== undefined ? { toBlock } : {}),
       partial: false,
     };
   }
@@ -341,7 +341,7 @@ export class WalletTransactionFetcher {
     let pages = 0;
 
     while (pages < maxPages) {
-      const [nativePage, tokenPage] = await Promise.all([
+      const [nativePage, tokenPage]: [BlockscoutPage<BlockscoutTx>, BlockscoutPage<BlockscoutTokenTransfer>] = await Promise.all([
         fetchBlockscoutPage<BlockscoutTx>(
           this.baseUrl, addr, 'transactions', fixedParams, nativeNextPage,
         ),
@@ -394,7 +394,7 @@ export class WalletTransactionFetcher {
       chain: this.chain,
       address: addr,
       fromBlock,
-      toBlock,
+      ...(toBlock !== undefined ? { toBlock } : {}),
       partial: false,
     };
   }
@@ -415,7 +415,7 @@ export class WalletTransactionFetcher {
     let pages = 0;
 
     while (pages < maxPages) {
-      const page = await fetchBlockscoutPage<BlockscoutTx | BlockscoutTokenTransfer>(
+      const page: BlockscoutPage<BlockscoutTx | BlockscoutTokenTransfer> = await fetchBlockscoutPage<BlockscoutTx | BlockscoutTokenTransfer>(
         this.baseUrl, addr, kind, fixedParams, nextPage,
       );
 

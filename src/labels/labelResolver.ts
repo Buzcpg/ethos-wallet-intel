@@ -104,12 +104,7 @@ export class LabelResolver {
 
   /**
    * Seed the DB from CEX_SEED_LABELS (idempotent).
-   * Safe to call at startup — uses ON CONFLICT DO NOTHING via upsert.
-   */
-  /**
-   * Seed the DB from CEX_SEED_LABELS (idempotent).
-   * Uses a single batch INSERT … ON CONFLICT DO NOTHING to replace the
-   * previous N*2 round-trip loop.
+   * Uses a single batch INSERT … ON CONFLICT DO NOTHING — safe to call at startup.
    */
   async seedFromStaticList(): Promise<void> {
     if (CEX_SEED_LABELS.length === 0) return;
