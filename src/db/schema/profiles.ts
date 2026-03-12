@@ -1,9 +1,10 @@
-import { pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+import { pgTable, text, timestamp, uuid, integer } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
 export const profiles = pgTable('profiles', {
   id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
-  externalProfileId: text('external_profile_id').unique().notNull(),
+  // L4: integer — Ethos profile IDs are always numeric; eliminates CAST in raw SQL
+  externalProfileId: integer('external_profile_id').unique().notNull(),
   slug: text('slug'),
   displayName: text('display_name'),
   status: text('status').default('active'),
