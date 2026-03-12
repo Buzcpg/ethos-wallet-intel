@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { sql } from 'drizzle-orm';
+import { createTask } from '../taskRegistry.js';
 import { isValidChain, CHAIN_SLUGS } from '../../chains/index.js';
 import type { ChainSlug } from '../../chains/index.js';
 import { FirstFunderScanner } from '../../scanner/firstFunderScanner.js';
@@ -111,6 +112,7 @@ scanner.post('/full-scan-wallet', async (c) => {
 });
 
 // POST /scanner/full-scan-batch
+// H7 — Long-running: returns 202 immediately; poll GET /tasks/:taskId for results.
 scanner.post('/full-scan-batch', async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = scanBatchSchema.safeParse(body);
@@ -118,24 +120,28 @@ scanner.post('/full-scan-batch', async (c) => {
     return c.json({ error: 'Invalid request', details: parsed.error.flatten() }, 400);
   }
   const { chain, limit } = parsed.data;
-  const walletScanner = new WalletScanner();
-  const walletIds = await walletScanner.getUnscannedWallets(chain as ChainSlug, limit);
-  if (walletIds.length === 0) {
-    return c.json({
-      chain,
-      scanned: 0,
-      skipped: 0,
-      errors: 0,
-      totalTransactionsFetched: 0,
-      totalFirstFundersFound: 0,
-      totalDepositEvidenceFound: 0,
-      totalP2PMatchesFound: 0,
-      durationMs: 0,
-      results: [],
-    });
-  }
-  const result = await walletScanner.scanBatch(walletIds, chain as ChainSlug);
-  return c.json(result);
+
+  const taskId = createTask(async () => {
+    const walletScanner = new WalletScanner();
+    const walletIds = await walletScanner.getUnscannedWallets(chain as ChainSlug, limit);
+    if (walletIds.length === 0) {
+      return {
+        chain,
+        scanned: 0,
+        skipped: 0,
+        errors: 0,
+        totalTransactionsFetched: 0,
+        totalFirstFundersFound: 0,
+        totalDepositEvidenceFound: 0,
+        totalP2PMatchesFound: 0,
+        durationMs: 0,
+        results: [],
+      };
+    }
+    return walletScanner.scanBatch(walletIds, chain as ChainSlug);
+  });
+
+  return c.json({ taskId, status: 'accepted' }, 202);
 });
 
 // GET /scanner/deposit-stats

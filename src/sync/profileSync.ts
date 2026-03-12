@@ -91,7 +91,7 @@ export class ProfileSyncService {
       return { walletsUpserted: 0 };
     }
 
-    const internalId = await this.getInternalProfileId(profileId.toString());
+    const internalId = await this.getInternalProfileId(profileId);
     if (!internalId) {
       throw new Error(
         `[ProfileSyncService] No internal profile row for Ethos profile ${profileId}`,
@@ -107,14 +107,21 @@ export class ProfileSyncService {
     stats: SyncStats,
     dryRun: boolean,
   ): Promise<void> {
+    // H2 / M8 — bulk upsert entire batch in one statement; errors are isolated below.
     if (!dryRun) {
-      await this.upsertProfiles(batch);
+      try {
+        await this.upsertProfiles(batch);
+      } catch (err) {
+        console.error('[ProfileSyncService] bulk upsertProfiles failed:', err);
+        // Continue — wallets for already-existing profiles may still be upsertable
+      }
     }
 
     const profileIds = batch.map((p) => p.id);
     const addressMap = await this.client.fetchAddressesBatch(profileIds);
 
     for (const profile of batch) {
+      // M8 — per-profile try/catch so one bad profile doesn't block the rest
       try {
         const addressData = addressMap.get(profile.id);
 
@@ -124,7 +131,7 @@ export class ProfileSyncService {
         }
 
         if (!dryRun) {
-          const internalId = await this.getInternalProfileId(profile.id.toString());
+          const internalId = await this.getInternalProfileId(profile.id);
           if (internalId) {
             const count = await this.upsertWallets(internalId, addressData, 'ethos_api');
             stats.walletsUpserted += count;
@@ -143,31 +150,35 @@ export class ProfileSyncService {
     }
   }
 
+  /**
+   * H2 — Bulk upsert: single INSERT ... ON CONFLICT DO UPDATE for the entire batch.
+   */
   async upsertProfiles(batch: EthosProfile[]): Promise<void> {
+    if (batch.length === 0) return;
     const database = this.getDbFn();
 
-    for (const profile of batch) {
-      await database
-        .insert(profiles)
-        .values({
-          externalProfileId: profile.id.toString(),
+    await database
+      .insert(profiles)
+      .values(
+        batch.map((profile) => ({
+          externalProfileId: profile.id,
           displayName: profile.displayName,
           slug: profile.username,
           status: profile.status,
-        })
-        .onConflictDoUpdate({
-          target: profiles.externalProfileId,
-          set: {
-            displayName: profile.displayName,
-            slug: profile.username,
-            status: profile.status,
-            updatedAt: new Date(),
-          },
-        });
-    }
+        })),
+      )
+      .onConflictDoUpdate({
+        target: profiles.externalProfileId,
+        set: {
+          displayName: sql`excluded.display_name`,
+          slug: sql`excluded.slug`,
+          status: sql`excluded.status`,
+          updatedAt: new Date(),
+        },
+      });
   }
 
-  async getInternalProfileId(externalId: string): Promise<string | null> {
+  async getInternalProfileId(externalId: number): Promise<string | null> {
     const database = this.getDbFn();
     const [row] = await database
       .select({ id: profiles.id })
@@ -178,12 +189,9 @@ export class ProfileSyncService {
   }
 
   /**
-   * Upsert wallet rows: one row per (address, chain) pair across all supported chains.
-   * All addresses stored lowercase.
-   * Uses onConflictDoUpdate on (address, chain) — safe to call multiple times (idempotent).
-   *
-   * New-user fast path: for genuinely new wallet rows (not previously in DB),
-   * immediately enqueues a new_user scan job without waiting for the nightly orchestrator.
+   * H2 — Bulk upsert wallets: single INSERT ... ON CONFLICT DO UPDATE RETURNING.
+   * Replaces N×6 sequential round-trips with one statement.
+   * xmax=0 → new row inserted → enqueue new_user scan job immediately.
    *
    * Returns the number of rows attempted.
    */
@@ -195,60 +203,55 @@ export class ProfileSyncService {
     const database = this.getDbFn();
     const { primaryAddress, allAddresses } = addressData;
     const chains = Object.keys(SUPPORTED_CHAINS) as ChainSlug[];
-    let count = 0;
 
-    for (const chain of chains) {
-      for (const address of allAddresses) {
+    const valueTuples = chains.flatMap((chain) =>
+      allAddresses.map((address) => {
         const normalised = address.toLowerCase();
         const isPrimary = normalised === (primaryAddress?.toLowerCase() ?? '');
+        return {
+          id: randomUUID(),
+          profileId: internalProfileId,
+          address: normalised,
+          chain,
+          isPrimary,
+          walletSource: source,
+          firstSeenAt: new Date(),
+          lastSeenAt: new Date(),
+        };
+      }),
+    );
 
-        // Use INSERT ... ON CONFLICT and check if the row was inserted (new) vs updated.
-        // We detect "new" by checking if created_at equals updated_at (set on insert only)
-        // OR by using the returning clause and checking if createdAt is recent.
-        // Simplest: use a sentinel value — set a flag column, or query before/after.
-        // Clean approach: use INSERT ... ON CONFLICT DO UPDATE ... RETURNING xmax.
-        // xmax=0 → new row inserted; xmax>0 → existing row updated.
-        const result = await database
-          .insert(wallets)
-          .values({
-            id: randomUUID(),
-            profileId: internalProfileId,
-            address: normalised,
-            chain,
-            isPrimary,
-            walletSource: source,
-            firstSeenAt: new Date(),
-            lastSeenAt: new Date(),
-          })
-          .onConflictDoUpdate({
-            target: [wallets.address, wallets.chain],
-            set: {
-              profileId: internalProfileId,
-              isPrimary,
-              lastSeenAt: new Date(),
-            },
-          })
-          .returning({ id: wallets.id, xmax: sql<string>`xmax` });
+    if (valueTuples.length === 0) return 0;
 
-        // xmax=0 means the row was inserted (new wallet)
-        const row = result[0];
-        if (row) {
-          const isNewRow = row.xmax === '0';
-          if (isNewRow) {
-            // New-user fast path: enqueue scan immediately
-            await enqueueJob(row.id, chain, 'new_user', {}).catch((err) => {
-              console.warn(
-                `[ProfileSyncService] failed to enqueue new_user job for wallet ${row.id} on ${chain}:`,
-                err,
-              );
-            });
-          }
-        }
+    const result = await database
+      .insert(wallets)
+      .values(valueTuples)
+      .onConflictDoUpdate({
+        target: [wallets.address, wallets.chain],
+        set: {
+          profileId: internalProfileId,
+          isPrimary: sql`excluded.is_primary`,
+          lastSeenAt: new Date(),
+        },
+      })
+      .returning({
+        id: wallets.id,
+        chain: wallets.chain,
+        xmax: sql<string>`xmax`,
+      });
 
-        count++;
+    // Enqueue new_user jobs for genuinely new wallet rows (xmax='0' means INSERT, not UPDATE)
+    for (const row of result) {
+      if (row.xmax === '0') {
+        await enqueueJob(row.id, row.chain as ChainSlug, 'new_user', {}).catch((err) => {
+          console.warn(
+            `[ProfileSyncService] failed to enqueue new_user job for wallet ${row.id} on ${row.chain}:`,
+            err,
+          );
+        });
       }
     }
 
-    return count;
+    return result.length;
   }
 }

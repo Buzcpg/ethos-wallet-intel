@@ -66,7 +66,6 @@ export class FirstFunderMatcher {
   private async detectSharedFunder(chain: ChainSlug, stats: MatchStats): Promise<void> {
     const database = this.getDbFn();
 
-    // Find funder addresses shared by 2+ wallets on this chain
     const result = await database.execute<{ funder_address: string; wallet_ids: string[] }>(
       sql`
         SELECT funder_address, array_agg(wallet_id::text) AS wallet_ids
@@ -140,7 +139,8 @@ export class FirstFunderMatcher {
   // ---------------------------------------------------------------------------
 
   /**
-   * For each pair in walletIds, create a wallet_match row and corresponding profile_match.
+   * H4 — For each pair in walletIds: collect all candidates, do ONE bulk existence
+   * check, then bulk-insert new wallet_match rows. Same for profile matches.
    */
   private async processWalletPairs(
     walletIds: string[],
@@ -154,100 +154,132 @@ export class FirstFunderMatcher {
 
     // Generate all unique pairs
     const pairs = this.uniquePairs(walletIds);
+    if (pairs.length === 0) return;
+
     // Resolve profile IDs for all wallets in one query
     const profileMap = await this.resolveProfileIds(walletIds, database);
 
-    for (const [walletAId, walletBId] of pairs) {
-      // Check if wallet_match already exists
-      const existing = await database
-        .select({ id: walletMatches.id })
-        .from(walletMatches)
-        .where(
-          and(
-            eq(walletMatches.walletAId, walletAId),
-            eq(walletMatches.walletBId, walletBId),
-            eq(walletMatches.matchType, matchType),
-            eq(walletMatches.chain, chain),
-            eq(walletMatches.matchKey, matchKey),
-          ),
-        )
-        .limit(1);
+    // H4 — Bulk existence check for wallet_matches
+    // Build a tuple array for a WHERE (a, b, type, chain, key) IN (...) style check
+    const existingWalletMatches = await database.execute<{
+      wallet_a_id: string;
+      wallet_b_id: string;
+    }>(
+      sql`
+        SELECT wallet_a_id, wallet_b_id
+        FROM ${walletMatches}
+        WHERE chain = ${chain}
+          AND match_type = ${matchType}
+          AND match_key = ${matchKey}
+          AND (wallet_a_id, wallet_b_id) IN (
+            ${sql.join(
+              pairs.map(([a, b]) => sql`(${a}, ${b})`),
+              sql`, `,
+            )}
+          )
+      `,
+    );
 
-      if (existing.length === 0) {
-        await database.insert(walletMatches).values({
+    const existingSet = new Set(
+      (existingWalletMatches.rows ?? []).map(
+        (r) => `${r.wallet_a_id}:${r.wallet_b_id}`,
+      ),
+    );
+
+    // Bulk-insert new wallet_match rows
+    const newPairs = pairs.filter(([a, b]) => !existingSet.has(`${a}:${b}`));
+    if (newPairs.length > 0) {
+      await database.insert(walletMatches).values(
+        newPairs.map(([walletAId, walletBId]) => ({
           walletAId,
           walletBId,
           matchType,
           chain,
           matchKey,
           score: score.toFixed(2),
-        });
-        stats.walletMatchesCreated++;
-      }
+        })),
+      );
+      stats.walletMatchesCreated += newPairs.length;
+    }
 
-      // Profile match
+    // Collect profile pairs for upsert
+    const profilePairs: Array<[string, string]> = [];
+    for (const [walletAId, walletBId] of pairs) {
       const profileAId = profileMap.get(walletAId);
       const profileBId = profileMap.get(walletBId);
 
-      if (!profileAId || !profileBId || profileAId === profileBId) {
-        continue;
-      }
+      if (!profileAId || !profileBId || profileAId === profileBId) continue;
 
       // Canonical ordering: smaller UUID first
       const [canonA, canonB] =
         profileAId < profileBId ? [profileAId, profileBId] : [profileBId, profileAId];
 
-      await this.upsertProfileMatch(canonA, canonB, score, database, stats);
+      profilePairs.push([canonA, canonB]);
     }
-  }
 
-  private async upsertProfileMatch(
-    profileAId: string,
-    profileBId: string,
-    score: number,
-    database: Db,
-    stats: MatchStats,
-  ): Promise<void> {
-    const existing = await database
+    // H4 — Profile matches: upsert one at a time (profile match upsert needs score comparison)
+    // We still collect and query in bulk for existence, then update only what needs updating.
+    if (profilePairs.length === 0) return;
+
+    const existingProfileMatches = await database
       .select({
         id: profileMatches.id,
+        profileAId: profileMatches.profileAId,
+        profileBId: profileMatches.profileBId,
         score: profileMatches.score,
         signalCount: profileMatches.signalCount,
       })
       .from(profileMatches)
       .where(
-        and(
-          eq(profileMatches.profileAId, profileAId),
-          eq(profileMatches.profileBId, profileBId),
-        ),
-      )
-      .limit(1);
+        sql`(${profileMatches.profileAId}, ${profileMatches.profileBId}) IN (
+          ${sql.join(
+            profilePairs.map(([a, b]) => sql`(${a}, ${b})`),
+            sql`, `,
+          )}
+        )`,
+      );
 
-    if (existing.length === 0) {
-      await database.insert(profileMatches).values({
-        profileAId,
-        profileBId,
-        score: score.toFixed(2),
-        signalCount: 1,
-        status: 'new',
-      });
-      stats.profileMatchesCreated++;
-    } else {
-      const current = existing[0]!;
-      const currentScore = parseFloat(current.score ?? '0');
-      const newScore = Math.max(currentScore, score);
-      const newSignalCount = (current.signalCount ?? 0) + 1;
+    const existingByKey = new Map(
+      existingProfileMatches.map((r) => [`${r.profileAId}:${r.profileBId}`, r]),
+    );
 
-      await database
-        .update(profileMatches)
-        .set({
-          score: newScore.toFixed(2),
-          signalCount: newSignalCount,
-          updatedAt: new Date(),
-        })
-        .where(eq(profileMatches.id, current.id));
+    const toCreate: Array<[string, string]> = [];
 
-      stats.profileMatchesUpdated++;
+    for (const [canonA, canonB] of profilePairs) {
+      const key = `${canonA}:${canonB}`;
+      const existing = existingByKey.get(key);
+
+      if (!existing) {
+        toCreate.push([canonA, canonB]);
+      } else {
+        const currentScore = parseFloat(existing.score ?? '0');
+        const newScore = Math.max(currentScore, score);
+        const newSignalCount = (existing.signalCount ?? 0) + 1;
+
+        await database
+          .update(profileMatches)
+          .set({
+            score: newScore.toFixed(2),
+            signalCount: newSignalCount,
+            updatedAt: new Date(),
+          })
+          .where(eq(profileMatches.id, existing.id));
+
+        stats.profileMatchesUpdated++;
+      }
+    }
+
+    if (toCreate.length > 0) {
+      await database.insert(profileMatches).values(
+        toCreate.map(([profileAId, profileBId]) => ({
+          profileAId,
+          profileBId,
+          score: score.toFixed(2),
+          signalCount: 1,
+          status: 'new',
+        })),
+      );
+      stats.profileMatchesCreated += toCreate.length;
     }
   }
 

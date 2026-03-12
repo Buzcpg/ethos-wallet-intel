@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { ProfileSyncService } from '../../sync/profileSync.js';
 import type { FullSyncOptions } from '../../sync/profileSync.js';
+import { createTask } from '../taskRegistry.js';
 
 const sync = new Hono();
 
@@ -12,8 +13,8 @@ const fullSyncSchema = z.object({
 
 /**
  * POST /sync/profiles
- * Trigger a full profile sync. Returns SyncStats on completion.
- * Body: { "dryRun"?: boolean, "batchSize"?: number }
+ * H7 — Returns 202 Accepted immediately with a taskId.
+ * The full profile sync runs in the background; poll GET /tasks/:taskId for results.
  */
 sync.post('/profiles', async (c) => {
   const body = await c.req.json().catch(() => ({}));
@@ -23,26 +24,21 @@ sync.post('/profiles', async (c) => {
     return c.json({ error: 'Invalid request', details: parsed.error.flatten() }, 400);
   }
 
-  // Build options object without undefined values (exactOptionalPropertyTypes)
   const opts: FullSyncOptions = {};
   if (parsed.data.dryRun !== undefined) opts.dryRun = parsed.data.dryRun;
   if (parsed.data.batchSize !== undefined) opts.batchSize = parsed.data.batchSize;
 
-  const service = new ProfileSyncService();
+  const taskId = createTask(async () => {
+    const service = new ProfileSyncService();
+    return service.runFullSync(opts);
+  });
 
-  try {
-    const stats = await service.runFullSync(opts);
-    return c.json({ stats });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error('[sync] runFullSync failed:', err);
-    return c.json({ error: 'Sync failed', details: message }, 500);
-  }
+  return c.json({ taskId, status: 'accepted' }, 202);
 });
 
 /**
  * POST /sync/profile/:id
- * Sync a single profile by Ethos profile ID (integer).
+ * Sync a single profile by Ethos profile ID (integer). Synchronous — fast enough.
  */
 sync.post('/profile/:id', async (c) => {
   const rawId = c.req.param('id');

@@ -4,7 +4,7 @@ import { profiles } from './profiles.js';
 
 export const wallets = pgTable('wallets', {
   id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
-  profileId: uuid('profile_id').references(() => profiles.id),
+  profileId: uuid('profile_id').references(() => profiles.id).notNull(), // L5
   address: text('address').notNull(),
   chain: text('chain').notNull(),
   isPrimary: boolean('is_primary').default(false),
@@ -15,7 +15,7 @@ export const wallets = pgTable('wallets', {
   lastScannedAt: timestamp('last_scanned_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).default(sql`now()`),
 }, (table) => ({
-  addressChainUnique: unique().on(table.address, table.chain),
+  addressChainUnique: unique('uq_wallets_address_chain').on(table.address, table.chain), // L6
 }));
 
 export type Wallet = typeof wallets.$inferSelect;

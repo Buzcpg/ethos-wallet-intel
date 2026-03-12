@@ -4,6 +4,7 @@ import { isValidChain, CHAIN_SLUGS } from '../../chains/index.js';
 import type { ChainSlug } from '../../chains/index.js';
 import { WalletScanner } from '../../scanner/walletScanner.js';
 import { RescanOrchestrator } from '../../scanner/rescanOrchestrator.js';
+import { createTask } from '../taskRegistry.js';
 
 const rescan = new Hono();
 
@@ -30,7 +31,7 @@ const scheduleSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
-// POST /rescan/delta-wallet — delta scan a single wallet
+// POST /rescan/delta-wallet — delta scan a single wallet (synchronous)
 // ---------------------------------------------------------------------------
 
 rescan.post('/delta-wallet', async (c) => {
@@ -46,7 +47,8 @@ rescan.post('/delta-wallet', async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /rescan/delta-batch — delta scan next N wallets due on a chain
+// POST /rescan/delta-batch
+// H7 — Long-running: returns 202 immediately; poll GET /tasks/:taskId for results.
 // ---------------------------------------------------------------------------
 
 rescan.post('/delta-batch', async (c) => {
@@ -56,24 +58,28 @@ rescan.post('/delta-batch', async (c) => {
     return c.json({ error: 'Invalid request', details: parsed.error.flatten() }, 400);
   }
   const { chain, limit } = parsed.data;
-  const scanner = new WalletScanner();
-  const walletIds = await scanner.getWalletsDueForRescan(chain as ChainSlug, 0, limit);
-  if (walletIds.length === 0) {
-    return c.json({
-      chain,
-      scanned: 0,
-      skipped: 0,
-      errors: 0,
-      totalTransactionsFetched: 0,
-      totalFirstFundersFound: 0,
-      totalDepositEvidenceFound: 0,
-      totalP2PMatchesFound: 0,
-      durationMs: 0,
-      results: [],
-    });
-  }
-  const result = await scanner.deltaScanBatch(walletIds, chain as ChainSlug);
-  return c.json(result);
+
+  const taskId = createTask(async () => {
+    const scanner = new WalletScanner();
+    const walletIds = await scanner.getWalletsDueForRescan(chain as ChainSlug, 0, limit);
+    if (walletIds.length === 0) {
+      return {
+        chain,
+        scanned: 0,
+        skipped: 0,
+        errors: 0,
+        totalTransactionsFetched: 0,
+        totalFirstFundersFound: 0,
+        totalDepositEvidenceFound: 0,
+        totalP2PMatchesFound: 0,
+        durationMs: 0,
+        results: [],
+      };
+    }
+    return scanner.deltaScanBatch(walletIds, chain as ChainSlug);
+  });
+
+  return c.json({ taskId, status: 'accepted' }, 202);
 });
 
 // ---------------------------------------------------------------------------
@@ -100,13 +106,17 @@ rescan.post('/schedule', async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /rescan/sync-profiles — trigger profile sync delta (new-user fast path)
+// POST /rescan/sync-profiles
+// H7 — Long-running: returns 202 immediately; poll GET /tasks/:taskId for results.
 // ---------------------------------------------------------------------------
 
 rescan.post('/sync-profiles', async (c) => {
-  const orchestrator = new RescanOrchestrator();
-  const result = await orchestrator.syncNewProfiles();
-  return c.json(result);
+  const taskId = createTask(async () => {
+    const orchestrator = new RescanOrchestrator();
+    return orchestrator.syncNewProfiles();
+  });
+
+  return c.json({ taskId, status: 'accepted' }, 202);
 });
 
 // ---------------------------------------------------------------------------
