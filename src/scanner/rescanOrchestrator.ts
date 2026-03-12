@@ -169,7 +169,7 @@ export class RescanOrchestrator {
         try {
           await this.profileSync.syncProfile(id);
           newProfiles++;
-          newWallets += data.allAddresses.length * 6; // 6 chains per address
+          newWallets += data.allAddresses.length * CHAIN_SLUGS.length;
         } catch (err) {
           console.warn(`[RescanOrchestrator] syncNewProfiles: failed to sync profile ${id}:`, err);
         }
