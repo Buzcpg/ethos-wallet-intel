@@ -90,8 +90,17 @@ export class WalletDriftChecker {
 
       const rawIds = Array.from(idMap.keys());
 
-      // Fetch profiles_v2 rows from Supabase for this batch
-      const supabaseRows = await this.fetchSupabaseRows(rawIds);
+      // Fetch profiles_v2 rows from Supabase for this batch.
+      // If Supabase is unavailable we record the error and abort — retrying
+      // subsequent batches would just produce more errors.
+      let supabaseRows: SupabaseProfileRow[];
+      try {
+        supabaseRows = await this.fetchSupabaseRows(rawIds);
+      } catch (err) {
+        console.warn('[WalletDriftChecker] Supabase batch fetch failed — aborting run:', err);
+        stats.errors++;
+        break;
+      }
 
       for (const row of supabaseRows) {
         try {
