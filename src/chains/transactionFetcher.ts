@@ -2,6 +2,19 @@ import type { ChainSlug } from './index.js';
 import { env } from '../config/env.js';
 
 // ---------------------------------------------------------------------------
+// API key rotation — shared pool, round-robin across all requests.
+// Each key has its own per-account rate limit bucket per chain instance.
+// ---------------------------------------------------------------------------
+let _rotatorIdx = 0;
+function nextApiKey(): string | undefined {
+  const keys = (env.BLOCKSCOUT_API_KEYS ?? '')
+    .split(',').map(k => k.trim()).filter(Boolean);
+  if (keys.length === 0) return undefined;
+  return keys[_rotatorIdx++ % keys.length];
+}
+import { env } from '../config/env.js';
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -92,20 +105,24 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithRetry(url: string, retries = 3, backoffMs = 1000): Promise<Response> {
-  let lastErr: unknown;
+async function fetchWithRetry(url: string, retries = 5, backoffMs = 800): Promise<Response> {
+  let lastErr: Error = new Error('fetchWithRetry: no attempts made');
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const response = await fetch(url);
       if (response.ok) return response;
       if (response.status === 429) {
-        await sleep(backoffMs * (attempt + 1));
+        // Rate limited — exponential backoff (1.6s, 3.2s, 6.4s, 12.8s, 25.6s)
+        const wait = backoffMs * Math.pow(2, attempt);
+        await sleep(wait);
+        lastErr = new Error(`Rate limited (429) after ${attempt + 1} attempts`);
         continue;
       }
-      throw new Error(`Blockscout API returned ${response.status}`);
+      lastErr = new Error(`Blockscout API returned ${response.status}`);
+      if (attempt < retries - 1) await sleep(backoffMs);
     } catch (err) {
-      lastErr = err;
-      if (attempt < retries - 1) await sleep(backoffMs * (attempt + 1));
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      if (attempt < retries - 1) await sleep(backoffMs);
     }
   }
   throw lastErr;
@@ -203,6 +220,10 @@ async function fetchBlockscoutPage<T>(
   for (const [k, v] of Object.entries(fixedParams)) {
     url.searchParams.set(k, v);
   }
+
+  // API key rotation — each key has its own rate limit bucket
+  const apiKey = nextApiKey();
+  if (apiKey) url.searchParams.set('apikey', apiKey);
 
   // next_page_params override/extend the fixed params
   if (nextPageParams) {
