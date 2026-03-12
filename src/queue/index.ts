@@ -1,3 +1,4 @@
+import { env } from './config/env.js';
 import { db as getDb } from '../db/client.js';
 import { walletScanJobs } from '../db/schema/index.js';
 import type { WalletScanJob, JobStatus } from '../jobs/types.js';
