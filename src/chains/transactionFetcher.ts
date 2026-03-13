@@ -103,7 +103,7 @@ interface BlockscoutPage<T> {
 // x-ratelimit-reset is in milliseconds.
 const BLOCKSCOUT_CONFIGS: Record<string, { baseUrl: string; v1Url: string; chainId: number }> = {
   ethereum: { chainId: 1,     baseUrl: 'https://api.blockscout.com/1/api/v2',     v1Url: 'https://api.blockscout.com/v2/api' },
-  base:     { chainId: 8453,  baseUrl: 'https://api.blockscout.com/8453/api/v2',  v1Url: 'https://api.blockscout.com/v2/api' },
+  base:     { chainId: 84532, baseUrl: 'https://api.blockscout.com/84532/api/v2',  v1Url: 'https://api.blockscout.com/v2/api' },
   arbitrum: { chainId: 42161, baseUrl: 'https://api.blockscout.com/42161/api/v2', v1Url: 'https://api.blockscout.com/v2/api' },
   optimism: { chainId: 10,    baseUrl: 'https://api.blockscout.com/10/api/v2',    v1Url: 'https://api.blockscout.com/v2/api' },
   polygon:  { chainId: 137,   baseUrl: 'https://api.blockscout.com/137/api/v2',   v1Url: 'https://api.blockscout.com/v2/api' },
