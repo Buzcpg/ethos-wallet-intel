@@ -57,11 +57,17 @@ const FUNDER_LABELS: Record<string, FunderLabel> = {
   '0x4200000000000000000000000000000000000010': { type: 'bridge', name: 'Optimism L2 bridge',         confidence: 0.7 },
   '0x4dbd4fc535ac27206064b68ffcf827b0a60bab3f': { type: 'bridge', name: 'Arbitrum inbox',             confidence: 0.7 },
   '0x8484ef722627bf18ca5ae6bcf031c23e6e922b30': { type: 'bridge', name: 'Across protocol',            confidence: 0.7 },
+  '0x8731d54e9d02c286767d56ac03e8037c07e01e98': { type: 'bridge', name: 'Stargate router',            confidence: 0.7 },
+  '0x45a01e4e04f14f7a4a6702c74187c5f6222033cd': { type: 'bridge', name: 'Stargate router (Poly)',     confidence: 0.7 },
+  '0x25ace71c97b33cc4729cf772ae268934f7ab5fa1': { type: 'bridge', name: 'Hop protocol',               confidence: 0.7 },
+  '0x3666f603cc164936c1b87e207f36beba4ac5f18a': { type: 'bridge', name: 'Synapse bridge',             confidence: 0.7 },
   // DEX routers — swap-funded; source wallet unclear, lowest signal
   '0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad': { type: 'dex',    name: 'Uniswap Universal Router',  confidence: 0.5 },
   '0x2626664c2603336e57b271c5c0b26f421741e481': { type: 'dex',    name: 'Uniswap V3 Router (Base)',   confidence: 0.5 },
-  '0x6131b5fae19ea4f9d964eac0408e4408b66337b5': { type: 'dex',    name: 'Kyberswap',                 confidence: 0.5 },
+  '0x6131b5fae19ea4f9d964eac0408e4408b66337b5': { type: 'dex',    name: 'Kyberswap',                  confidence: 0.5 },
   '0x1111111254eeb25477b68fb85ed929f73a960582': { type: 'dex',    name: '1inch v5',                   confidence: 0.5 },
+  '0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f': { type: 'dex',    name: 'SushiSwap router',           confidence: 0.5 },
+  '0xdef1c0ded9bec7f1a1670819833240f027b25eff': { type: 'dex',    name: '0x Exchange Proxy',          confidence: 0.5 },
   // CEX hot wallets — useful clustering signal
   '0x28c6c06298d514db089934071355e5743bf21d60': { type: 'cex',    name: 'Binance hot wallet',         confidence: 0.8 },
   '0x21a31ee1afc51d94c2efccaa2092ad1028285549': { type: 'cex',    name: 'Binance cold wallet',        confidence: 0.8 },
@@ -128,7 +134,7 @@ interface AlchemyTransfer {
 }
 
 interface AlchemyResponse {
-  result?: { transfers: AlchemyTransfer[] };
+  result?: { transfers: AlchemyTransfer[]; pageKey?: string };
   error?: { message: string; code?: number };
 }
 
@@ -138,6 +144,17 @@ interface AlchemyResponse {
 
 let _callId = 0;
 
+// Errors that warrant a retry with backoff
+const RETRYABLE_STRINGS = [
+  'rate limited',
+  'service unavailable',
+  'econnreset',
+  'etimedout',
+  'fetch failed',
+  'network',
+  'socket',
+];
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -146,14 +163,17 @@ async function alchemyCall(
   url: string,
   params: Record<string, unknown>,
   retries = 4,
-): Promise<AlchemyTransfer[]> {
+): Promise<{ transfers: AlchemyTransfer[]; pageKey?: string }> {
   const id = ++_callId;
   let lastErr: Error = new Error('alchemyCall: no attempts');
 
   for (let attempt = 0; attempt < retries; attempt++) {
-    await acquireToken();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30_000);
 
     try {
+      await acquireToken();
+
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -163,6 +183,7 @@ async function alchemyCall(
           method: 'alchemy_getAssetTransfers',
           params: [params],
         }),
+        signal: controller.signal,
       });
 
       if (env.LOG_LEVEL === 'debug') {
@@ -195,14 +216,21 @@ async function alchemyCall(
         throw new Error(`Alchemy RPC error: ${data.error.message}`);
       }
 
-      return data.result?.transfers ?? [];
+      const transfers = data.result?.transfers ?? [];
+      const pageKey = data.result?.pageKey;
+      return pageKey !== undefined ? { transfers, pageKey } : { transfers };
     } catch (err) {
+      const isAbort = err instanceof Error && err.name === 'AbortError';
       const isRetryable =
-        err instanceof Error &&
-        (err.message.startsWith('rate limited') || err.message.startsWith('service unavailable'));
+        isAbort ||
+        (err instanceof Error &&
+          RETRYABLE_STRINGS.some((s) => (err as Error).message.toLowerCase().includes(s)));
       if (!isRetryable) throw err;
       lastErr = err as Error;
-      if (attempt < retries - 1) await sleep(500);
+      const backoffMs = Math.min(1_000 * Math.pow(2, attempt), 30_000);
+      if (attempt < retries - 1) await sleep(backoffMs);
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
@@ -229,7 +257,10 @@ function normalise(
   const blockTimestamp = tsStr ? new Date(tsStr) : new Date(0);
   if (isNaN(blockTimestamp.getTime())) return null;
 
-  const toAddr = tx.to?.toLowerCase() ?? '';
+  const toAddr = tx.to?.toLowerCase() ?? null;
+  // Contract creation (or malformed): tx.to is null — not relevant to wallet scan
+  if (toAddr === null) return null;
+
   const fromAddr = tx.from.toLowerCase();
   const lowerWallet = walletAddr.toLowerCase();
 
@@ -291,7 +322,8 @@ interface FirstFunderResult {
   transactions: RawTransaction[];
   confidence: number;
   funderType: FunderType;
-  funderLabel: string;  // human-readable name, empty for EOA
+  funderLabel: string;    // human-readable name, empty for EOA
+  firstPageFull: boolean; // true if first page hit maxCount (suggests truncation)
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +372,8 @@ export class AlchemyFetcher {
       totalFetched: allTxs.length,
       chain: this.chain,
       address: addr,
-      partial: false,
+      // partial: true when either call hit its hard cap — walletScanner should deep-scan
+      partial: (funderResult?.firstPageFull === true || outbound.length >= 50),
       ...(toBlock !== undefined ? { toBlock } : {}),
     };
   }
@@ -356,7 +389,7 @@ export class AlchemyFetcher {
     // Inbound: all native + erc20 since fromBlock
     const inboundCats = [...new Set([...cats, 'erc20'])];
 
-    const rawInbound = await alchemyCall(this.url, {
+    const { transfers: rawInbound } = await alchemyCall(this.url, {
       toAddress: addr,
       fromBlock: fromHex,
       toBlock: 'latest',
@@ -366,7 +399,7 @@ export class AlchemyFetcher {
       withMetadata: true,
       excludeZeroValue: true,
     });
-    const rawOutbound = await alchemyCall(this.url, {
+    const { transfers: rawOutbound } = await alchemyCall(this.url, {
       fromAddress: addr,
       fromBlock: fromHex,
       toBlock: 'latest',
@@ -405,43 +438,71 @@ export class AlchemyFetcher {
   }
 
   // ---------------------------------------------------------------------------
-  // Tiered first-funder detection (1–2 calls)
+  // Tiered first-funder detection — paginate up to MAX_PAGES per tier
   // ---------------------------------------------------------------------------
 
   private async findFirstFunder(addr: string): Promise<FirstFunderResult | null> {
     const cats = nativeCategories(this.chain);
+    const MAX_PAGES = 3;
+    const NATIVE_MAX_COUNT = 10; // 0xa
 
-    // Tier 1: native ETH inbound, oldest-first, limit 10
-    const rawNative = await alchemyCall(this.url, {
-      toAddress: addr,
-      fromBlock: '0x0',
-      toBlock: 'latest',
-      category: cats,
-      order: 'asc',
-      maxCount: '0xa',
-      withMetadata: true,
-      excludeZeroValue: true,
-    });
+    const allTxs: RawTransaction[] = [];
+    let firstTransfer: AlchemyTransfer | null = null;
+    let firstPageFull = false;
+    let pageKey: string | undefined;
+    let foundEoa = false;
 
-    if (rawNative.length > 0) {
-      const txs: RawTransaction[] = [];
-      for (const t of rawNative) {
+    // Tier 1: native ETH inbound, oldest-first, paginate up to MAX_PAGES
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const callParams: Record<string, unknown> = {
+        toAddress: addr,
+        fromBlock: '0x0',
+        toBlock: 'latest',
+        category: cats,
+        order: 'asc',
+        maxCount: '0xa',
+        withMetadata: true,
+        excludeZeroValue: true,
+      };
+      if (pageKey !== undefined) callParams['pageKey'] = pageKey;
+
+      const { transfers: raw, pageKey: nextKey } = await alchemyCall(this.url, callParams);
+
+      if (raw.length === 0) break;
+
+      // Record first transfer (oldest overall) from the very first page
+      if (page === 0) {
+        firstTransfer = raw[0] ?? null;
+        firstPageFull = raw.length >= NATIVE_MAX_COUNT;
+      }
+
+      for (const t of raw) {
         const tx = normalise(t, addr, this.chain);
-        if (tx) txs.push(tx);
+        if (tx) allTxs.push(tx);
+        // Track whether we've found an EOA funder on this page
+        if (!foundEoa && classifyFunder(t.from).type === 'eoa') {
+          foundEoa = true;
+        }
       }
 
-      // Classify the first (oldest) funder — never skip, always store
-      const firstFunder = rawNative[0]!;
-      const classification = classifyFunder(firstFunder.from);
+      // Stop as soon as we find an EOA or there are no more pages
+      if (foundEoa || !nextKey) break;
+      pageKey = nextKey;
+    }
+
+    if (allTxs.length > 0 && firstTransfer !== null) {
+      const classification = classifyFunder(firstTransfer.from);
       if (env.LOG_LEVEL === 'debug') {
-        console.debug(`[alchemyFetcher] first funder: ${firstFunder.from} type=${classification.type} confidence=${classification.confidence}${classification.name ? ' (' + classification.name + ')' : ''}`);
+        console.debug(
+          `[alchemyFetcher] first funder: ${firstTransfer.from} type=${classification.type} confidence=${classification.confidence}${classification.name ? ' (' + classification.name + ')' : ''}`,
+        );
       }
-
       return {
-        transactions: txs,
+        transactions: allTxs,
         confidence: classification.confidence,
         funderType: classification.type,
         funderLabel: classification.name,
+        firstPageFull,
       };
     }
 
@@ -449,66 +510,103 @@ export class AlchemyFetcher {
     const stables = STABLE_CONTRACTS[this.chain] ?? [];
     if (stables.length === 0) return null;
 
-    const rawStable = await alchemyCall(this.url, {
-      toAddress: addr,
-      fromBlock: '0x0',
-      toBlock: 'latest',
-      category: ['erc20'],
-      contractAddresses: stables,
-      order: 'asc',
-      maxCount: '0xa',
-      withMetadata: true,
-      excludeZeroValue: true,
-    });
+    const stableTxs: RawTransaction[] = [];
+    let stableFirstTransfer: AlchemyTransfer | null = null;
+    let stableFirstPageFull = false;
+    let stablePageKey: string | undefined;
+    let stableFoundEoa = false;
 
-    if (rawStable.length === 0) return null;
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const callParams: Record<string, unknown> = {
+        toAddress: addr,
+        fromBlock: '0x0',
+        toBlock: 'latest',
+        category: ['erc20'],
+        contractAddresses: stables,
+        order: 'asc',
+        maxCount: '0xa',
+        withMetadata: true,
+        excludeZeroValue: true,
+      };
+      if (stablePageKey !== undefined) callParams['pageKey'] = stablePageKey;
 
-    const txs: RawTransaction[] = [];
-    for (const t of rawStable) {
-      const tx = normalise(t, addr, this.chain);
-      if (tx) txs.push(tx);
+      const { transfers: raw, pageKey: nextKey } = await alchemyCall(this.url, callParams);
+
+      if (raw.length === 0) break;
+
+      if (page === 0) {
+        stableFirstTransfer = raw[0] ?? null;
+        stableFirstPageFull = raw.length >= 10;
+      }
+
+      for (const t of raw) {
+        const tx = normalise(t, addr, this.chain);
+        if (tx) stableTxs.push(tx);
+        if (!stableFoundEoa && classifyFunder(t.from).type === 'eoa') {
+          stableFoundEoa = true;
+        }
+      }
+
+      if (stableFoundEoa || !nextKey) break;
+      stablePageKey = nextKey;
     }
 
-    // Classify the first stablecoin funder — never skip
-    const firstStableFunder = rawStable[0]!;
-    const stableClass = classifyFunder(firstStableFunder.from);
+    if (stableTxs.length === 0 || stableFirstTransfer === null) return null;
+
+    const stableClass = classifyFunder(stableFirstTransfer.from);
     // Stablecoin tier is inherently one step less certain than native ETH,
     // so cap confidence at 0.7 even for EOAs
     const stableConfidence = Math.min(stableClass.confidence, 0.7);
     if (env.LOG_LEVEL === 'debug') {
-      console.debug(`[alchemyFetcher] first stable funder: ${firstStableFunder.from} type=${stableClass.type} confidence=${stableConfidence}`);
+      console.debug(
+        `[alchemyFetcher] first stable funder: ${stableFirstTransfer.from} type=${stableClass.type} confidence=${stableConfidence}`,
+      );
     }
 
     return {
-      transactions: txs,
+      transactions: stableTxs,
       confidence: stableConfidence,
       funderType: stableClass.type,
       funderLabel: stableClass.name,
+      firstPageFull: stableFirstPageFull,
     };
   }
 
   // ---------------------------------------------------------------------------
-  // Recent outbound (1 call, desc, limit 50)
+  // Recent outbound (desc, limit 50 per page, paginate up to MAX_PAGES)
   // ---------------------------------------------------------------------------
 
   private async fetchRecentOutbound(addr: string): Promise<RawTransaction[]> {
-    const rawOutbound = await alchemyCall(this.url, {
-      fromAddress: addr,
-      fromBlock: '0x0',
-      toBlock: 'latest',
-      category: ['external', 'erc20'],
-      order: 'desc',
-      maxCount: '0x32', // 50
-      withMetadata: false,
-      excludeZeroValue: true,
-    });
+    const MAX_PAGES = 3;
+    const allTxs: RawTransaction[] = [];
+    let pageKey: string | undefined;
 
-    const txs: RawTransaction[] = [];
-    for (const t of rawOutbound) {
-      const tx = normalise(t, addr, this.chain);
-      if (tx) txs.push(tx);
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const callParams: Record<string, unknown> = {
+        fromAddress: addr,
+        fromBlock: '0x0',
+        toBlock: 'latest',
+        category: ['external', 'erc20'],
+        order: 'desc',
+        maxCount: '0x32', // 50
+        withMetadata: false,
+        excludeZeroValue: true,
+      };
+      if (pageKey !== undefined) callParams['pageKey'] = pageKey;
+
+      const { transfers: raw, pageKey: nextKey } = await alchemyCall(this.url, callParams);
+
+      for (const t of raw) {
+        const tx = normalise(t, addr, this.chain);
+        if (tx) allTxs.push(tx);
+      }
+
+      // Stop if no more pages or this page was under the cap (not truncated)
+      if (!nextKey || raw.length < 50) break;
+      pageKey = nextKey;
     }
-    return txs;
+
+    return allTxs;
   }
 
   // ---------------------------------------------------------------------------
