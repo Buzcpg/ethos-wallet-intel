@@ -245,7 +245,6 @@ describe('WalletScanner', () => {
       depositEvidenceFound: 1,
       p2pMatchesFound: 0,
       partial: false,
-      deepScanReasons: [],
       durationMs: 100,
     });
 
