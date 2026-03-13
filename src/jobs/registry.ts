@@ -15,6 +15,8 @@ const backfillHandler: JobHandler = async (job) => {
   const scanner = new WalletScanner();
   const result = await scanner.scanWallet(job.walletId, job.chain);
 
+  if (result.error) throw new Error(result.error);
+
   // Auto-enqueue deep_scan for wallets where windowed scan was truncated
   if (result.partial) {
     await enqueueJob(job.walletId, job.chain as ChainSlug, 'deep_scan').catch((err: unknown) => {
