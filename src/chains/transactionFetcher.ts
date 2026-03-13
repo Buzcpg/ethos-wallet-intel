@@ -1,26 +1,6 @@
 import type { ChainSlug } from './index.js';
 import { env } from '../config/env.js';
-
-// ---------------------------------------------------------------------------
-// API key rotation — shared pool, round-robin across all requests.
-// Each key has its own per-account rate limit bucket per chain instance.
-// ---------------------------------------------------------------------------
-let _rotatorIdx = 0;
-function nextApiKey(): string | undefined {
-  const keys = (env.BLOCKSCOUT_API_KEYS ?? '')
-    .split(',').map(k => k.trim()).filter(Boolean);
-  if (keys.length === 0) return undefined;
-  return keys[_rotatorIdx++ % keys.length];
-}
-
-/**
- * Returns the PRO API key for use as apikey= query param.
- * PRO API is multichain via https://api.blockscout.com/{chain_id}/...
- * Both apikey query param and Authorization: Bearer are accepted.
- */
-function proApiKey(): string | undefined {
-  return env.BLOCKSCOUT_PRO_API_KEY;
-}
+import { acquireToken } from '../lib/rateLimiter.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -96,11 +76,14 @@ interface BlockscoutPage<T> {
 // Blockscout chain config
 // ---------------------------------------------------------------------------
 
-// Blockscout PRO API config (https://api.blockscout.com)
-// v2 REST:  https://api.blockscout.com/{chain_id}/api/v2/...   — cursor-based DESC pagination
-// v1 compat: https://api.blockscout.com/v2/api?chain_id={id}  — supports sort=asc (first-funder)
-// Both use apikey=proapi_xxx query param. Rate limit: 5 RPS total, 100K credits/day (free tier).
-// x-ratelimit-reset is in milliseconds.
+// Blockscout PRO API (https://api.blockscout.com)
+// v2 REST:   https://api.blockscout.com/{chain_id}/api/v2/...  — cursor-based DESC pagination
+// v1 compat: https://api.blockscout.com/v2/api?chain_id={id}  — supports sort=asc
+// Auth:      ?apikey=proapi_xxx on every request
+// Rate limit: 5 RPS TOTAL across all chains (shared global bucket)
+// Credits:   100k/day; x-credits-remaining header on every response
+// x-ratelimit-reset: milliseconds (not seconds!)
+// Chain IDs: ethereum=1, base=84532 (NOT 8453), arbitrum=42161, optimism=10, polygon=137
 const BLOCKSCOUT_CONFIGS: Record<string, { baseUrl: string; v1Url: string; chainId: number }> = {
   ethereum: { chainId: 1,     baseUrl: 'https://api.blockscout.com/1/api/v2',     v1Url: 'https://api.blockscout.com/v2/api' },
   base:     { chainId: 84532, baseUrl: 'https://api.blockscout.com/84532/api/v2',  v1Url: 'https://api.blockscout.com/v2/api' },
@@ -110,6 +93,18 @@ const BLOCKSCOUT_CONFIGS: Record<string, { baseUrl: string; v1Url: string; chain
 };
 
 // ---------------------------------------------------------------------------
+// API key helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the PRO API key for use as ?apikey= query param.
+ * PRO API is multichain via https://api.blockscout.com/{chain_id}/...
+ */
+function proApiKey(): string | undefined {
+  return env.BLOCKSCOUT_PRO_API_KEY;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -117,30 +112,89 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithRetry(url: string, retries = 4, backoffMs = 1500, extraHeaders: Record<string,string> = {}): Promise<Response> {
-  let lastErr: Error = new Error('fetchWithRetry: no attempts made');
-  for (let attempt = 0; attempt < retries; attempt++) {
-    try {
-      const response = await fetch(url, {
-        headers: extraHeaders,
-      });
-      if (response.ok) return response;
+/**
+ * Parse x-credits-remaining from response headers and log warnings.
+ * Called after every successful (2xx) response.
+ */
+function checkCreditHeaders(response: Response, urlPath: string): void {
+  const creditsHeader = response.headers.get('x-credits-remaining');
+  if (creditsHeader !== null) {
+    const credits = Number(creditsHeader);
+    if (!isNaN(credits)) {
+      if (credits < 1000) {
+        console.error(`[fetcher] ⚠️  CRITICAL: only ${credits} Blockscout credits remaining! ${urlPath}`);
+      } else if (credits < 10000) {
+        console.warn(`[fetcher] ⚠️  LOW CREDITS: ${credits} Blockscout credits remaining. ${urlPath}`);
+      }
+    }
+  }
+}
 
-      if (response.status === 429 || response.status === 503) {
-        // 429 = rate limited, 503 = Blockscout instance down
-        const wait = backoffMs * Math.pow(2, attempt); // 1.5s, 3s, 6s, 12s
-        const label = response.status === 429 ? 'rate limited (429)' : 'service unavailable (503)';
-        console.warn(`[fetcher] ${label} — waiting ${Math.round(wait/1000)}s (attempt ${attempt+1}/${retries}): ${url.split('?')[0]}`);
-        await sleep(wait);
-        lastErr = new Error(`${label} after ${attempt + 1} attempts`);
+/**
+ * fetchWithRetry — acquire a global rate-limiter token before EVERY request.
+ *
+ * Rate limit handling:
+ *   - 429: read x-ratelimit-reset (milliseconds) + 100ms buffer, then retry
+ *   - 503: wait 10s then retry
+ *   - Other non-ok: throw immediately (no retry)
+ *
+ * Credit monitoring:
+ *   - 2xx responses: read x-credits-remaining; warn < 10k, error < 1k
+ *
+ * Debug logging:
+ *   - Every request: URL path (no query string) + HTTP status
+ */
+async function fetchWithRetry(
+  url: string,
+  retries = 4,
+  extraHeaders: Record<string, string> = {},
+): Promise<Response> {
+  const urlPath = url.split('?')[0]!;
+  let lastErr: Error = new Error('fetchWithRetry: no attempts made');
+
+  for (let attempt = 0; attempt < retries; attempt++) {
+    // Acquire global rate-limiter token before every HTTP request (including retries)
+    await acquireToken();
+
+    try {
+      const response = await fetch(url, { headers: extraHeaders });
+
+      if (env.LOG_LEVEL === 'debug') {
+        console.debug(`[fetcher] ${response.status} ${urlPath}`);
+      }
+
+      if (response.ok) {
+        checkCreditHeaders(response, urlPath);
+        return response;
+      }
+
+      if (response.status === 429) {
+        // x-ratelimit-reset is in MILLISECONDS
+        const resetHeader = response.headers.get('x-ratelimit-reset');
+        const waitMs = resetHeader !== null ? Number(resetHeader) + 100 : 1500 * Math.pow(2, attempt);
+        console.warn(`[fetcher] rate limited (429) — waiting ${Math.round(waitMs)}ms (attempt ${attempt + 1}/${retries}): ${urlPath}`);
+        await sleep(waitMs);
+        lastErr = new Error(`rate limited (429) after attempt ${attempt + 1}`);
         continue;
       }
 
-      // All other non-ok statuses are real errors — don't retry
-      throw new Error(`Blockscout returned ${response.status} for ${url.split('?')[0]}`);
+      if (response.status === 503) {
+        const waitMs = 10_000;
+        console.warn(`[fetcher] service unavailable (503) — waiting ${waitMs / 1000}s (attempt ${attempt + 1}/${retries}): ${urlPath}`);
+        await sleep(waitMs);
+        lastErr = new Error(`service unavailable (503) after attempt ${attempt + 1}`);
+        continue;
+      }
+
+      // All other non-ok statuses are hard errors — don't retry
+      throw new Error(`Blockscout returned ${response.status} for ${urlPath}`);
     } catch (err) {
+      // Re-throw hard errors immediately (non-network, non-rate-limit)
+      if (err instanceof Error && !err.message.startsWith('rate limited') && !err.message.startsWith('service unavailable')) {
+        throw err;
+      }
       lastErr = err instanceof Error ? err : new Error(String(err));
-      if (attempt < retries - 1) await sleep(backoffMs);
+      if (attempt < retries - 1) await sleep(500);
     }
   }
   throw lastErr;
@@ -231,9 +285,7 @@ async function fetchBlockscoutPage<T>(
   kind: 'transactions' | 'token-transfers',
   fixedParams: Record<string, string>,
   nextPageParams?: BlockscoutNextPage | null,
-  chain?: string,
 ): Promise<BlockscoutPage<T>> {
-  if (chain) await chainRateLimit(chain);
   const url = new URL(`${baseUrl}/addresses/${address}/${kind}`);
 
   // PRO API key — required for all tiers
@@ -254,6 +306,7 @@ async function fetchBlockscoutPage<T>(
     }
   }
 
+  // fetchWithRetry acquires global rate-limiter token before firing
   const response = await fetchWithRetry(url.toString());
   return (await response.json()) as BlockscoutPage<T>;
 }
@@ -261,16 +314,6 @@ async function fetchBlockscoutPage<T>(
 // ---------------------------------------------------------------------------
 // WalletTransactionFetcher
 // ---------------------------------------------------------------------------
-
-// Per-chain rate limiter: ensures we don't exceed 1 req/sec per chain
-// (PRO free tier = 5 RPS total across all chains — 1/chain is safe)
-const _lastReqMs: Record<string, number> = {};
-async function chainRateLimit(chain: string, minGapMs = 1000): Promise<void> {
-  const last = _lastReqMs[chain] ?? 0;
-  const wait = minGapMs - (Date.now() - last);
-  if (wait > 0) await sleep(wait);
-  _lastReqMs[chain] = Date.now();
-}
 
 export class WalletTransactionFetcher {
   private readonly chain: ChainSlug;
@@ -312,16 +355,13 @@ export class WalletTransactionFetcher {
 
     // v2 API (DESC, newest first) — for recent tx window used by deposit detection
     // NOTE: v2 API does NOT accept sort or limit params — omit them entirely
-    const [txsDescNative, txsDescTokens] = await Promise.all([
-      this.fetchNPages(addr, 'transactions',    {}, pagesLast),
-      this.fetchNPages(addr, 'token-transfers', {}, pagesLast),
-    ]);
+    // Serial: native then tokens to keep within global rate limit
+    const txsDescNative = await this.fetchNPages(addr, 'transactions',    {}, pagesLast);
+    const txsDescTokens = await this.fetchNPages(addr, 'token-transfers', {}, pagesLast);
 
     // v1 compat API (ASC, oldest first) — for first-funder detection
-    const [txsAscNative, txsAscTokens] = await Promise.all([
-      this.fetchV1Oldest(addr, 'txlist',  env.SCAN_WINDOW_FIRST),
-      this.fetchV1Oldest(addr, 'tokentx', env.SCAN_WINDOW_FIRST),
-    ]);
+    const txsAscNative = await this.fetchV1Oldest(addr, 'txlist',  env.SCAN_WINDOW_FIRST);
+    const txsAscTokens = await this.fetchV1Oldest(addr, 'tokentx', env.SCAN_WINDOW_FIRST);
 
     const merged = this.dedup([
       ...txsAscNative.txs, ...txsAscTokens.txs,
@@ -350,14 +390,11 @@ export class WalletTransactionFetcher {
 
   private async fetchDeepScan(addr: string): Promise<FetchResult> {
     // Full history: v2 DESC all pages + v1 ASC all pages, merged
-    const [descNative, descTokens] = await Promise.all([
-      this.fetchNPages(addr, 'transactions',    {}, Infinity),
-      this.fetchNPages(addr, 'token-transfers', {}, Infinity),
-    ]);
-    const [ascNative, ascTokens] = await Promise.all([
-      this.fetchV1Oldest(addr, 'txlist',  999999),
-      this.fetchV1Oldest(addr, 'tokentx', 999999),
-    ]);
+    // Serial fetches to honour global 5 RPS budget
+    const descNative = await this.fetchNPages(addr, 'transactions',    {}, Infinity);
+    const descTokens = await this.fetchNPages(addr, 'token-transfers', {}, Infinity);
+    const ascNative  = await this.fetchV1Oldest(addr, 'txlist',  999999);
+    const ascTokens  = await this.fetchV1Oldest(addr, 'tokentx', 999999);
 
     const merged = this.dedup([
       ...ascNative.txs, ...ascTokens.txs,
@@ -384,8 +421,7 @@ export class WalletTransactionFetcher {
 
   private async fetchFromBlock(addr: string, fromBlock: bigint): Promise<FetchResult> {
     const maxPages = env.SCAN_MAX_PAGES_DELTA;
-    // fetchFromBlock uses v1 compat API for ASC ordering
-    const fixedParams: Record<string,string> = {}; // v2: no sort/limit — use v1 for ASC
+    const fixedParams: Record<string, string> = {};
 
     const allTxs: RawTransaction[] = [];
     let nativeNextPage: BlockscoutNextPage | null = null;
@@ -393,14 +429,13 @@ export class WalletTransactionFetcher {
     let pages = 0;
 
     while (pages < maxPages) {
-      const [nativePage, tokenPage]: [BlockscoutPage<BlockscoutTx>, BlockscoutPage<BlockscoutTokenTransfer>] = await Promise.all([
-        fetchBlockscoutPage<BlockscoutTx>(
-          this.baseUrl, addr, 'transactions', fixedParams, nativeNextPage,
-        ),
-        fetchBlockscoutPage<BlockscoutTokenTransfer>(
-          this.baseUrl, addr, 'token-transfers', fixedParams, tokenNextPage,
-        ),
-      ]);
+      // Serial: fetch native then token-transfers (each acquires a global token)
+      const nativePage: BlockscoutPage<BlockscoutTx> = await fetchBlockscoutPage<BlockscoutTx>(
+        this.baseUrl, addr, 'transactions', fixedParams, nativeNextPage,
+      );
+      const tokenPage: BlockscoutPage<BlockscoutTokenTransfer> = await fetchBlockscoutPage<BlockscoutTokenTransfer>(
+        this.baseUrl, addr, 'token-transfers', fixedParams, tokenNextPage,
+      );
 
       // C4 — only include confirmed transactions at or after fromBlock
       const newNative = (nativePage.items ?? []).filter(
@@ -467,9 +502,10 @@ export class WalletTransactionFetcher {
     let pages = 0;
 
     while (pages < maxPages) {
-      const page: BlockscoutPage<BlockscoutTx | BlockscoutTokenTransfer> = await fetchBlockscoutPage<BlockscoutTx | BlockscoutTokenTransfer>(
-        this.baseUrl, addr, kind, fixedParams, nextPage, this.chain,
-      );
+      const page: BlockscoutPage<BlockscoutTx | BlockscoutTokenTransfer> =
+        await fetchBlockscoutPage<BlockscoutTx | BlockscoutTokenTransfer>(
+          this.baseUrl, addr, kind, fixedParams, nextPage,
+        );
 
       for (const item of page.items ?? []) {
         const tx =
@@ -525,6 +561,7 @@ export class WalletTransactionFetcher {
 
       let data: { status: string; message: string; result: unknown };
       try {
+        // fetchWithRetry acquires global rate-limiter token before firing
         const response = await fetchWithRetry(url.toString());
         data = await response.json() as typeof data;
       } catch (err) {
@@ -534,7 +571,7 @@ export class WalletTransactionFetcher {
 
       if (data.status !== '1') {
         // status=0 + message=No transactions found is normal for inactive addresses
-        if (data.message?.includes('No transactions') || data.message?.includes('No records')) {
+        if (data.message?.includes('No transactions') || data.message?.includes('No records') || data.message?.includes('No token transfers') || data.message?.includes('No transfers')) {
           return { txs: allTxs, exhausted: true };
         }
         // Any other error (rate limit, API down) — log and bail
