@@ -24,6 +24,7 @@ const envSchema = z.object({
   // Create keys at each chain's Blockscout instance → My Account → API Keys
   BLOCKSCOUT_API_KEYS: z.string().optional(),
   BLOCKSCOUT_PRO_API_KEY: z.string().optional(), // multichain, Authorization: Bearer
+  ALCHEMY_API_KEY: z.string().min(1),
   // Comma-separated chain slugs to skip in dequeue (for maintenance/debugging)
   SKIP_CHAINS: z.string().optional(),
   // Supabase — profile ID enumeration (faster than Ethos API pagination)

@@ -1,13 +1,12 @@
 /**
- * Global token bucket rate limiter for the Blockscout PRO API.
+ * Global token bucket rate limiter for the Alchemy API.
  *
- * The PRO free tier allows 5 RPS TOTAL across all chains combined.
- * This module exposes a single shared bucket that all fetchers must
- * acquire from before firing an HTTP request.
+ * Alchemy free tier: 330 CU/sec. Each alchemy_getAssetTransfers call ≈ 150 CU.
+ * Conservative cap: 2 calls/sec (300 CU/sec, leaves ~10% headroom).
  *
  * Bucket parameters:
- *   - Capacity: 5 tokens (max burst)
- *   - Refill rate: 5 tokens / second (one token every 200 ms)
+ *   - Capacity: 2 tokens (max burst)
+ *   - Refill rate: 2 tokens / second (one token every 500 ms)
  *
  * Usage:
  *   import { acquireToken } from '../lib/rateLimiter.js';
@@ -15,8 +14,8 @@
  *   const resp = await fetch(url);
  */
 
-const MAX_TOKENS = 5;
-const REFILL_INTERVAL_MS = 200; // 1000 / 5 = one token every 200 ms
+const MAX_TOKENS = 2;
+const REFILL_INTERVAL_MS = 500; // 1000 / 2 = one token every 500 ms
 
 let tokens = MAX_TOKENS;
 let lastRefillTime = Date.now();
@@ -32,7 +31,7 @@ function refillTokens(): void {
   const newTokens = Math.floor(elapsed / REFILL_INTERVAL_MS);
   if (newTokens > 0) {
     tokens = Math.min(MAX_TOKENS, tokens + newTokens);
-    lastRefillTime += newTokens * REFILL_INTERVAL_MS; // don't lose fractional time
+    lastRefillTime += newTokens * REFILL_INTERVAL_MS;
   }
 }
 
@@ -52,7 +51,6 @@ async function processQueue(): Promise<void> {
       const resolve = resolveQueue.shift()!;
       resolve();
     } else {
-      // Wait for the next token slot
       const msUntilNext = REFILL_INTERVAL_MS - (Date.now() - lastRefillTime) + 1;
       await new Promise<void>((r) => setTimeout(r, Math.max(10, msUntilNext)));
     }
