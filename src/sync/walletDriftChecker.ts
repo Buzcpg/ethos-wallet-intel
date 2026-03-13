@@ -111,7 +111,7 @@ export class WalletDriftChecker {
           const internalId = idMap.get(row.raw_profile_id);
           if (!internalId) continue;
 
-          const addressData = parseAddressesFromUserkeys(row.userkeys);
+          const addressData = parseAddressesFromUserkeys(row.userkeys, row.primary_address);
           if (addressData.allAddresses.length === 0) continue;
 
           // Get addresses already stored for this profile
@@ -175,7 +175,7 @@ export class WalletDriftChecker {
       const subBatch = rawIds.slice(i, i + SUPABASE_SUB_BATCH);
 
       const url = new URL(`${env.SUPABASE_URL}/rest/v1/profiles_v2`);
-      url.searchParams.set('select', 'raw_profile_id,display_name,username,status,score,userkeys');
+      url.searchParams.set('select', 'raw_profile_id,display_name,username,status,score,userkeys,primary_address');
       url.searchParams.set('raw_profile_id', `in.(${subBatch.join(',')})`);
 
       const res = await fetch(url.toString(), {
