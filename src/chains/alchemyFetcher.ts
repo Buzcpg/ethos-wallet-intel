@@ -213,7 +213,7 @@ function normalise(
   const fromAddr = tx.from.toLowerCase();
   const lowerWallet = walletAddr.toLowerCase();
 
-  const isErc20 = tx.category === 'erc20';
+  const isErc20 = tx.category === 'erc20' || tx.category === 'token';
 
   // valueWei: use rawContract.value (hex) for precision; fall back to float
   let valueWei = '0';
@@ -302,10 +302,8 @@ export class AlchemyFetcher {
   // ---------------------------------------------------------------------------
 
   private async fetchWindowed(addr: string): Promise<FetchResult> {
-    const [funderResult, outbound] = await Promise.all([
-      this.findFirstFunder(addr),
-      this.fetchRecentOutbound(addr),
-    ]);
+    const funderResult = await this.findFirstFunder(addr);
+    const outbound = await this.fetchRecentOutbound(addr);
 
     const inbound = funderResult?.transactions ?? [];
     const allTxs = this.dedup([...inbound, ...outbound]);
@@ -336,28 +334,26 @@ export class AlchemyFetcher {
     // Inbound: all native + erc20 since fromBlock
     const inboundCats = [...new Set([...cats, 'erc20'])];
 
-    const [rawInbound, rawOutbound] = await Promise.all([
-      alchemyCall(this.url, {
-        toAddress: addr,
-        fromBlock: fromHex,
-        toBlock: 'latest',
-        category: inboundCats,
-        order: 'asc',
-        maxCount: '0x64', // 100
-        withMetadata: true,
-        excludeZeroValue: true,
-      }),
-      alchemyCall(this.url, {
-        fromAddress: addr,
-        fromBlock: fromHex,
-        toBlock: 'latest',
-        category: ['external', 'erc20'],
-        order: 'desc',
-        maxCount: '0x32', // 50
-        withMetadata: true,
-        excludeZeroValue: true,
-      }),
-    ]);
+    const rawInbound = await alchemyCall(this.url, {
+      toAddress: addr,
+      fromBlock: fromHex,
+      toBlock: 'latest',
+      category: inboundCats,
+      order: 'asc',
+      maxCount: '0x64', // 100
+      withMetadata: true,
+      excludeZeroValue: true,
+    });
+    const rawOutbound = await alchemyCall(this.url, {
+      fromAddress: addr,
+      fromBlock: fromHex,
+      toBlock: 'latest',
+      category: ['external', 'erc20'],
+      order: 'desc',
+      maxCount: '0x32', // 50
+      withMetadata: true,
+      excludeZeroValue: true,
+    });
 
     const txs: RawTransaction[] = [];
     for (const t of rawInbound) {
@@ -407,13 +403,33 @@ export class AlchemyFetcher {
 
     if (rawNative.length > 0) {
       const txs: RawTransaction[] = [];
-
       for (const t of rawNative) {
         const tx = normalise(t, addr, this.chain);
         if (tx) txs.push(tx);
       }
 
-      return { transactions: txs, confidence: 1.0 };
+      // Walk in order (asc = oldest first); skip known bridge/DEX contracts
+      let confidence = 0.5; // default: all funders were contracts
+      for (const t of rawNative) {
+        const fromLower = t.from.toLowerCase();
+        if (fromLower in KNOWN_CONTRACTS) {
+          if (env.LOG_LEVEL === 'debug') {
+            console.debug(`[alchemyFetcher] skip known contract: ${fromLower} (${KNOWN_CONTRACTS[fromLower]})`);
+          }
+          continue;
+        }
+        // Found an EOA funder
+        confidence = 1.0;
+        break;
+      }
+
+      if (confidence < 1.0) {
+        if (env.LOG_LEVEL === 'debug') {
+          console.debug(`[alchemyFetcher] all native funders are known contracts — confidence 0.5`);
+        }
+      }
+
+      return { transactions: txs, confidence };
     }
 
     // Tier 2: stablecoin fallback (only if tier 1 returned nothing)
@@ -440,7 +456,21 @@ export class AlchemyFetcher {
       if (tx) txs.push(tx);
     }
 
-    return { transactions: txs, confidence: 0.8 };
+    // Walk stablecoin results; EOA sender → confidence 0.8, all contracts → 0.5
+    let confidence = 0.5;
+    for (const t of rawStable) {
+      const fromLower = t.from.toLowerCase();
+      if (fromLower in KNOWN_CONTRACTS) {
+        if (env.LOG_LEVEL === 'debug') {
+          console.debug(`[alchemyFetcher] skip known contract (stable tier): ${fromLower} (${KNOWN_CONTRACTS[fromLower]})`);
+        }
+        continue;
+      }
+      confidence = 0.8;
+      break;
+    }
+
+    return { transactions: txs, confidence };
   }
 
   // ---------------------------------------------------------------------------
@@ -455,7 +485,7 @@ export class AlchemyFetcher {
       category: ['external', 'erc20'],
       order: 'desc',
       maxCount: '0x32', // 50
-      withMetadata: true,
+      withMetadata: false,
       excludeZeroValue: true,
     });
 
