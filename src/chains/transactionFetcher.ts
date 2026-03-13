@@ -14,15 +14,12 @@ function nextApiKey(): string | undefined {
 }
 
 /**
- * Returns the Authorization header for Blockscout PRO API.
- * PRO key uses Bearer header; My Account keys use ?apikey= query param.
- * PRO key is multichain; My Account key is per-chain-instance only.
+ * Returns the PRO API key for use as apikey= query param.
+ * PRO API is multichain via https://api.blockscout.com/{chain_id}/...
+ * Both apikey query param and Authorization: Bearer are accepted.
  */
-function proAuthHeader(): Record<string, string> {
-  const proKey = env.BLOCKSCOUT_PRO_API_KEY;
-  if (proKey) return { Authorization: `Bearer ${proKey}` };
-  // Fall back to no auth header (My Account key is added as query param separately)
-  return {};
+function proApiKey(): string | undefined {
+  return env.BLOCKSCOUT_PRO_API_KEY;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,16 +96,17 @@ interface BlockscoutPage<T> {
 // Blockscout chain config
 // ---------------------------------------------------------------------------
 
-// Blockscout chain config
-// v2: cursor-based DESC pagination — used for recent tx window (deposit detection)
-// v1: Etherscan-compat API — supports sort=asc, used for first-funder detection
-const BLOCKSCOUT_CONFIGS: Record<string, { baseUrl: string; v1Url: string }> = {
-  ethereum: { baseUrl: 'https://eth.blockscout.com/api/v2', v1Url: 'https://eth.blockscout.com/api' },
-  base:     { baseUrl: 'https://base.blockscout.com/api/v2', v1Url: 'https://base.blockscout.com/api' },
-  arbitrum: { baseUrl: 'https://arbitrum.blockscout.com/api/v2', v1Url: 'https://arbitrum.blockscout.com/api' },
-  optimism: { baseUrl: 'https://optimism.blockscout.com/api/v2', v1Url: 'https://optimism.blockscout.com/api' },
-  polygon:  { baseUrl: 'https://polygon.blockscout.com/api/v2', v1Url: 'https://polygon.blockscout.com/api' },
-  // Avalanche removed — Snowtrace does not support Blockscout v1 compat API reliably
+// Blockscout PRO API config (https://api.blockscout.com)
+// v2 REST:  https://api.blockscout.com/{chain_id}/api/v2/...   — cursor-based DESC pagination
+// v1 compat: https://api.blockscout.com/v2/api?chain_id={id}  — supports sort=asc (first-funder)
+// Both use apikey=proapi_xxx query param. Rate limit: 5 RPS total, 100K credits/day (free tier).
+// x-ratelimit-reset is in milliseconds.
+const BLOCKSCOUT_CONFIGS: Record<string, { baseUrl: string; v1Url: string; chainId: number }> = {
+  ethereum: { chainId: 1,     baseUrl: 'https://api.blockscout.com/1/api/v2',     v1Url: 'https://api.blockscout.com/v2/api' },
+  base:     { chainId: 8453,  baseUrl: 'https://api.blockscout.com/8453/api/v2',  v1Url: 'https://api.blockscout.com/v2/api' },
+  arbitrum: { chainId: 42161, baseUrl: 'https://api.blockscout.com/42161/api/v2', v1Url: 'https://api.blockscout.com/v2/api' },
+  optimism: { chainId: 10,    baseUrl: 'https://api.blockscout.com/10/api/v2',    v1Url: 'https://api.blockscout.com/v2/api' },
+  polygon:  { chainId: 137,   baseUrl: 'https://api.blockscout.com/137/api/v2',   v1Url: 'https://api.blockscout.com/v2/api' },
 };
 
 // ---------------------------------------------------------------------------
@@ -238,12 +236,16 @@ async function fetchBlockscoutPage<T>(
   if (chain) await chainRateLimit(chain);
   const url = new URL(`${baseUrl}/addresses/${address}/${kind}`);
 
-  // Fixed params first (address, sort, limit)
+  // PRO API key — required for all tiers
+  const apiKey = proApiKey();
+  if (apiKey) url.searchParams.set('apikey', apiKey);
+
+  // Fixed params
   for (const [k, v] of Object.entries(fixedParams)) {
     url.searchParams.set(k, v);
   }
 
-  // next_page_params override/extend the fixed params
+  // Cursor pagination params
   if (nextPageParams) {
     for (const [k, v] of Object.entries(nextPageParams)) {
       if (v !== null && v !== undefined) {
@@ -252,7 +254,7 @@ async function fetchBlockscoutPage<T>(
     }
   }
 
-  const response = await fetchWithRetry(url.toString(), 4, 1500, proAuthHeader());
+  const response = await fetchWithRetry(url.toString());
   return (await response.json()) as BlockscoutPage<T>;
 }
 
@@ -510,13 +512,15 @@ export class WalletTransactionFetcher {
 
     for (let page = 1; page <= pages; page++) {
       const url = new URL(config.v1Url);
+      // PRO v1 compat route requires chain_id
+      url.searchParams.set('chain_id', String(config.chainId));
       url.searchParams.set('module', 'account');
       url.searchParams.set('action', action);
       url.searchParams.set('address', addr);
       url.searchParams.set('sort', 'asc');
       url.searchParams.set('page', String(page));
       url.searchParams.set('offset', String(pageSize));
-      const apiKey = nextApiKey();
+      const apiKey = proApiKey();
       if (apiKey) url.searchParams.set('apikey', apiKey);
 
       let data: { status: string; message: string; result: unknown };
