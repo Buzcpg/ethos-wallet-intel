@@ -11,7 +11,7 @@ import { db as getDb } from '../src/db/client.js';
 import { profiles, wallets, firstFunderSignals } from '../src/db/schema/index.js';
 import { WalletTransactionFetcher } from '../src/chains/transactionFetcher.js';
 import { WalletScanner } from '../src/scanner/walletScanner.js';
-import { eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import type { ChainSlug } from '../src/chains/index.js';
 
 // Only these two profiles, ethereum only — ~4-8 API calls total
@@ -91,9 +91,12 @@ async function main() {
     })
     .from(wallets)
     .where(
-      inArray(wallets.profileId, profileIds),
-    )
-    .then(rows => rows.filter(w => w.chain === SCAN_CHAIN));
+      and(
+        inArray(wallets.profileId, profileIds),
+        eq(wallets.chain, SCAN_CHAIN),
+        eq(wallets.isPrimary, true),
+      )
+    );
 
   console.log(`  Found ${primaryWallets.length} wallet(s) on ${SCAN_CHAIN} for ${requiredProfiles.length} profiles`);
 
