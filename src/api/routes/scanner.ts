@@ -5,9 +5,7 @@ import { createTask } from '../taskRegistry.js';
 import { isValidChain, CHAIN_SLUGS } from '../../chains/index.js';
 import type { ChainSlug } from '../../chains/index.js';
 import { FirstFunderScanner } from '../../scanner/firstFunderScanner.js';
-import { FirstFunderMatcher } from '../../matcher/firstFunderMatcher.js';
 import { WalletScanner } from '../../scanner/walletScanner.js';
-import { LabelResolver } from '../../labels/labelResolver.js';
 import { db as getDb } from '../../db/client.js';
 import {
   wallets,
@@ -30,18 +28,6 @@ const scanWalletSchema = z.object({
 const scanBatchSchema = z.object({
   chain: z.string().refine(isValidChain, { message: 'Invalid chain' }),
   limit: z.coerce.number().int().positive().default(50),
-});
-
-const detectMatchesSchema = z.object({
-  chain: z
-    .string()
-    .refine(isValidChain, { message: 'Invalid chain' })
-    .optional(),
-});
-
-const labelResolveSchema = z.object({
-  address: z.string().min(1),
-  chain: z.string().refine(isValidChain, { message: 'Invalid chain' }),
 });
 
 // ---------------------------------------------------------------------------
@@ -76,22 +62,6 @@ scanner.post('/scan-batch', async (c) => {
   }
   const result = await svc.scanBatch(walletIds, chain as ChainSlug);
   return c.json(result);
-});
-
-// POST /scanner/detect-matches
-scanner.post('/detect-matches', async (c) => {
-  const body = await c.req.json().catch(() => null);
-  const parsed = detectMatchesSchema.safeParse(body ?? {});
-  if (!parsed.success) {
-    return c.json({ error: 'Invalid request', details: parsed.error.flatten() }, 400);
-  }
-  const matcher = new FirstFunderMatcher();
-  if (parsed.data.chain) {
-    const stats = await matcher.detectMatches(parsed.data.chain as ChainSlug);
-    return c.json({ [parsed.data.chain]: stats });
-  }
-  const stats = await matcher.detectAllChains();
-  return c.json(stats);
 });
 
 // ---------------------------------------------------------------------------
@@ -197,49 +167,6 @@ scanner.get('/p2p-stats', async (c) => {
     return c.json({ error: 'Failed to fetch p2p stats', details: message }, 500);
   }
 });
-
-// ---------------------------------------------------------------------------
-// M4: Label routes
-// ---------------------------------------------------------------------------
-
-// POST /labels/seed
-scanner.post('/labels/seed', async (c) => {
-  try {
-    const resolver = new LabelResolver();
-    await resolver.seedFromStaticList();
-    return c.json({ success: true, message: 'Label seed complete (idempotent)' });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error('[scanner] label seed failed:', err);
-    return c.json({ error: 'Label seed failed', details: message }, 500);
-  }
-});
-
-// POST /labels/resolve
-scanner.post('/labels/resolve', async (c) => {
-  const body = await c.req.json().catch(() => null);
-  const parsed = labelResolveSchema.safeParse(body);
-  if (!parsed.success) {
-    return c.json({ error: 'Invalid request', details: parsed.error.flatten() }, 400);
-  }
-  const { address, chain } = parsed.data;
-  try {
-    const resolver = new LabelResolver();
-    const label = await resolver.resolveLabel(address, chain as ChainSlug);
-    if (!label) {
-      return c.json({ address, chain, label: null });
-    }
-    return c.json({ address, chain, label });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error('[scanner] label resolve failed:', err);
-    return c.json({ error: 'Label resolution failed', details: message }, 500);
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Legacy stats (preserved)
-// ---------------------------------------------------------------------------
 
 // GET /scanner/stats
 scanner.get('/stats', async (c) => {

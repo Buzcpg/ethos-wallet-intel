@@ -2,9 +2,6 @@ import type { JobHandler, JobType } from './types.js';
 import type { ChainSlug } from '../chains/index.js';
 import { db } from '../db/client.js';
 import { WalletScanner } from '../scanner/walletScanner.js';
-import { FirstFunderScanner } from '../scanner/firstFunderScanner.js';
-import { FirstFunderMatcher } from '../matcher/firstFunderMatcher.js';
-import { LabelResolver } from '../labels/labelResolver.js';
 import { isValidChain } from '../chains/index.js';
 import { markFailed } from '../queue/index.js';
 
@@ -30,11 +27,6 @@ const backfillHandler: JobHandler = async (job) => {
   const scanner = new WalletScanner();
   const result = await scanner.scanWallet(job.walletId, job.chain);
   console.log(`[backfill] result:`, result);
-
-  // Run first-funder matcher after scan to pick up new matches
-  const matcher = new FirstFunderMatcher();
-  const matchStats = await matcher.detectMatches(job.chain);
-  console.log(`[backfill] match stats:`, matchStats);
 };
 
 /**
@@ -55,11 +47,6 @@ const deltaHandler: JobHandler = async (job) => {
   const scanner = new WalletScanner();
   const result = await scanner.deltaScanWallet(job.walletId, job.chain);
   console.log(`[delta] result:`, result);
-
-  // Re-run matcher to pick up any new signals discovered in delta
-  const matcher = new FirstFunderMatcher();
-  const matchStats = await matcher.detectMatches(job.chain);
-  console.log(`[delta] match stats:`, matchStats);
 };
 
 /**
@@ -95,15 +82,12 @@ export const jobRegistry: Record<JobType, JobHandler> = {
   manual: manualHandler,
   /**
    * deep_scan — fetches ALL transactions for a partial wallet (no window limit).
-   * Runs with DEEP_SCAN_PAGE_DELAY_MS between pages to stay within rate limits.
-   * Only queued for wallets where a previous scan returned partial=true.
    */
   deep_scan: async (job) => {
     if (!job.walletId) {
       console.warn('[deep_scan] Job missing walletId, skipping');
       return;
     }
-    // H9 — validate chain before proceeding (matches pattern of all other handlers)
     if (!isValidChain(job.chain)) {
       console.warn(`[deep_scan] Invalid chain "${job.chain}", marking job failed`);
       await markFailed(job.id, `Invalid chain: ${job.chain}`);
@@ -114,8 +98,3 @@ export const jobRegistry: Record<JobType, JobHandler> = {
     await scanner.scanWallet(job.walletId, job.chain as ChainSlug, { deepScan: true });
   },
 };
-
-// Suppress unused-import warning for LabelResolver and FirstFunderScanner
-// — these are available to handlers but only instantiated on demand.
-void (LabelResolver as unknown);
-void (FirstFunderScanner as unknown);

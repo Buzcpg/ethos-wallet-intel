@@ -180,6 +180,8 @@ export class P2PScanner {
     profileBId: string,
     score: number,
     database: Db,
+    matchType = 'direct_wallet_interaction',
+    matchKey = 'p2p',
   ): Promise<void> {
     const existing = await database
       .select({
@@ -200,6 +202,8 @@ export class P2PScanner {
       await database.insert(profileMatches).values({
         profileAId,
         profileBId,
+        matchType,
+        matchKey,
         score: score.toFixed(2),
         signalCount: 1,
         status: 'new',

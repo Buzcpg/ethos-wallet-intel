@@ -3,7 +3,6 @@ import { type Db, db as getDb } from '../db/client.js';
 import { depositTransferEvidence } from '../db/schema/index.js';
 import type { ChainSlug } from '../chains/index.js';
 import type { RawTransaction } from '../chains/transactionFetcher.js';
-import { LabelResolver } from '../labels/labelResolver.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -22,11 +21,9 @@ export interface DepositScanResult {
 
 export class DepositScanner {
   private readonly getDbFn: () => Db;
-  private readonly labelResolver: LabelResolver;
 
-  constructor(dbFn?: () => Db, labelResolver?: LabelResolver) {
+  constructor(dbFn?: () => Db) {
     this.getDbFn = dbFn ?? getDb;
-    this.labelResolver = labelResolver ?? new LabelResolver(dbFn);
   }
 
   /**
@@ -45,20 +42,9 @@ export class DepositScanner {
     // Only look at outbound transactions
     const outbound = transactions.filter((tx) => !tx.isInbound);
 
-    // Resolve unique counterparty addresses first (batch label lookups)
-    const uniqueRecipients = [...new Set(outbound.map((tx) => tx.toAddress).filter(Boolean))];
-    const labelCache = new Map<string, boolean>();
-
-    for (const recipient of uniqueRecipients) {
-      const label = await this.labelResolver.resolveLabel(recipient, chain);
-      const isCex =
-        label !== null &&
-        (label.labelKind === 'cex_deposit' || label.labelKind === 'exchange_hot_wallet');
-      labelCache.set(recipient, isCex);
-    }
-
-    // H3 — identify CEX-touching transactions first, then do ONE bulk existence check
-    const cexTxs = outbound.filter((tx) => tx.toAddress && labelCache.get(tx.toAddress));
+    // CEX label resolution removed (labelResolver superseded by alchemyFetcher path).
+    // Deposit detection disabled pending replacement implementation.
+    const cexTxs: typeof outbound = [];
 
     if (cexTxs.length === 0) {
       return { walletId, chain, depositsFound: 0, evidenceIds: [] };

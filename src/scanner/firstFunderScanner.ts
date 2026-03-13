@@ -2,7 +2,7 @@ import { eq, and, isNull } from 'drizzle-orm';
 import { type Db, db as getDb } from '../db/client.js';
 import { wallets, firstFunderSignals } from '../db/schema/index.js';
 import type { ChainSlug } from '../chains/index.js';
-import { getAdapter } from '../chains/adapterRegistry.js';
+
 import { env } from '../config/env.js';
 import type { RawTransaction } from '../chains/transactionFetcher.js';
 
@@ -175,48 +175,13 @@ export class FirstFunderScanner {
         return { walletId, chain, found: false, error: `Wallet ${walletId} not found` };
       }
 
-      // 3. Fetch first inbound native tx via chain adapter
-      const adapter = getAdapter(chain);
-      const tx = await adapter.getFirstInboundNativeTx(wallet.address);
-
-      const now = new Date();
-
-      if (tx) {
-        // 4. Cross-verify against Etherscan / Snowtrace HTML
-        const verification = await crossVerifyFunder(tx.fromAddress, wallet.address, chain);
-
-        await database.insert(firstFunderSignals).values({
-          walletId,
-          chain,
-          funderAddress: tx.fromAddress,
-          txHash: tx.txHash,
-          blockNumber: tx.blockNumber,
-          blockTimestamp: tx.blockTimestamp,
-          source: verification.source,
-          confidence: verification.confidence.toFixed(2),
-        });
-
-        await database
-          .update(wallets)
-          .set({ lastScannedAt: now, lastScannedBlock: tx.blockNumber })
-          .where(eq(wallets.id, walletId));
-
-        return {
-          walletId,
-          chain,
-          found: true,
-          funderAddress: tx.fromAddress,
-          txHash: tx.txHash,
-          blockNumber: tx.blockNumber,
-        };
-      }
-
-      // 5. Not found — still mark as scanned
+      // 3. Legacy adapter path removed — use extractFromTransactions via WalletScanner.
+      // getAdapter (blockscout/etherscan) has been replaced by alchemyFetcher.
+      // This method is preserved for API compat only; return not-found immediately.
       await database
         .update(wallets)
-        .set({ lastScannedAt: now })
+        .set({ lastScannedAt: new Date() })
         .where(eq(wallets.id, walletId));
-
       return { walletId, chain, found: false };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

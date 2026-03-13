@@ -22,6 +22,8 @@ export const profileMatches = pgTable('profile_matches', {
   id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
   profileAId: uuid('profile_a_id').references(() => profiles.id),
   profileBId: uuid('profile_b_id').references(() => profiles.id),
+  matchType: text('match_type').notNull(),
+  matchKey: text('match_key').notNull(),
   score: numeric('score', { precision: 5, scale: 2 }),
   signalCount: integer('signal_count').default(0),
   status: text('status').default('new'),

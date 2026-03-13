@@ -1,9 +1,8 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { isValidChain, CHAIN_SLUGS } from '../../chains/index.js';
+import { isValidChain } from '../../chains/index.js';
 import type { ChainSlug } from '../../chains/index.js';
 import { WalletScanner } from '../../scanner/walletScanner.js';
-import { RescanOrchestrator } from '../../scanner/rescanOrchestrator.js';
 import { createTask } from '../taskRegistry.js';
 
 const rescan = new Hono();
@@ -20,14 +19,6 @@ const deltaWalletSchema = z.object({
 const deltaBatchSchema = z.object({
   chain: z.string().refine(isValidChain, { message: 'Invalid chain' }),
   limit: z.coerce.number().int().positive().default(50),
-});
-
-const scheduleSchema = z.object({
-  chain: z
-    .string()
-    .refine(isValidChain, { message: 'Invalid chain' })
-    .optional(),
-  force: z.boolean().default(false),
 });
 
 // ---------------------------------------------------------------------------
@@ -80,54 +71,6 @@ rescan.post('/delta-batch', async (c) => {
   });
 
   return c.json({ taskId, status: 'accepted' }, 202);
-});
-
-// ---------------------------------------------------------------------------
-// POST /rescan/schedule — enqueue delta jobs for wallets due for rescan
-// ---------------------------------------------------------------------------
-
-rescan.post('/schedule', async (c) => {
-  const body = await c.req.json().catch(() => null);
-  const parsed = scheduleSchema.safeParse(body ?? {});
-  if (!parsed.success) {
-    return c.json({ error: 'Invalid request', details: parsed.error.flatten() }, 400);
-  }
-  const { chain, force } = parsed.data;
-  const orchestrator = new RescanOrchestrator();
-
-  if (chain) {
-    const { enqueued } = await orchestrator.scheduleRescan(chain as ChainSlug, { force });
-    return c.json({ chain, enqueued });
-  }
-
-  const results = await orchestrator.scheduleAllChains({ force });
-  const totalEnqueued = Object.values(results).reduce((sum, n) => sum + n, 0);
-  return c.json({ results, totalEnqueued });
-});
-
-// ---------------------------------------------------------------------------
-// POST /rescan/sync-profiles
-// H7 — Long-running: returns 202 immediately; poll GET /tasks/:taskId for results.
-// ---------------------------------------------------------------------------
-
-rescan.post('/sync-profiles', async (c) => {
-  const taskId = createTask(async () => {
-    const orchestrator = new RescanOrchestrator();
-    return orchestrator.syncNewProfiles();
-  });
-
-  return c.json({ taskId, status: 'accepted' }, 202);
-});
-
-// ---------------------------------------------------------------------------
-// GET /rescan/due-count — count wallets due for rescan per chain
-// ---------------------------------------------------------------------------
-
-rescan.get('/due-count', async (c) => {
-  const orchestrator = new RescanOrchestrator();
-  const counts = await orchestrator.getDueCounts();
-  const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
-  return c.json({ counts, total });
 });
 
 export default rescan;
