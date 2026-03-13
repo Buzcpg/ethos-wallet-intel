@@ -111,6 +111,12 @@ async function fetchWithRetry(url: string, retries = 5, backoffMs = 800): Promis
     try {
       const response = await fetch(url);
       if (response.ok) return response;
+      if (response.status === 422 || response.status === 404) {
+        // 422 = address has no transactions on this chain (totally normal for multi-chain wallets)
+        // 404 = address not found on this chain
+        // Return a sentinel so callers can treat it as empty rather than an error
+        return response;
+      }
       if (response.status === 429) {
         // Rate limited — exponential backoff (1.6s, 3.2s, 6.4s, 12.8s, 25.6s)
         const wait = backoffMs * Math.pow(2, attempt);
@@ -235,6 +241,10 @@ async function fetchBlockscoutPage<T>(
   }
 
   const response = await fetchWithRetry(url.toString());
+  // 422/404 = no transactions for this address on this chain — return empty page
+  if (response.status === 422 || response.status === 404) {
+    return { items: [] } as BlockscoutPage<T>;
+  }
   return (await response.json()) as BlockscoutPage<T>;
 }
 
