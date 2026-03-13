@@ -11,7 +11,7 @@ import { markFailed } from '../queue/index.js';
 
 /**
  * backfill — full three-signal scan via WalletScanner.
- * Single tx fetch, all extractors in parallel.
+ * Single tx fetch, all three extractors (firstFunder, deposit, p2p) in parallel.
  */
 const backfillHandler: JobHandler = async (job) => {
   if (!job.walletId) {
@@ -22,7 +22,6 @@ const backfillHandler: JobHandler = async (job) => {
     console.warn(`[backfill] Invalid chain "${job.chain}", skipping`);
     return;
   }
-
   console.log(`[backfill] full scan — wallet ${job.walletId} on ${job.chain}`);
   const scanner = new WalletScanner();
   const result = await scanner.scanWallet(job.walletId, job.chain);
@@ -42,24 +41,10 @@ const deltaHandler: JobHandler = async (job) => {
     console.warn(`[delta] Invalid chain "${job.chain}", skipping`);
     return;
   }
-
   console.log(`[delta] delta scan — wallet ${job.walletId} on ${job.chain}`);
   const scanner = new WalletScanner();
   const result = await scanner.deltaScanWallet(job.walletId, job.chain);
   console.log(`[delta] result:`, result);
-};
-
-/**
- * new_user — full scan for a newly synced wallet.
- */
-const newUserHandler: JobHandler = async (job) => {
-  if (!job.walletId || !isValidChain(job.chain)) {
-    console.warn('[new_user] invalid job, skipping');
-    return;
-  }
-  console.log(`[new_user] full scan — wallet ${job.walletId} on ${job.chain}`);
-  const scanner = new WalletScanner();
-  await scanner.scanWallet(job.walletId, job.chain);
 };
 
 /**
@@ -78,10 +63,10 @@ const manualHandler: JobHandler = async (job) => {
 export const jobRegistry: Record<JobType, JobHandler> = {
   backfill: backfillHandler,
   delta: deltaHandler,
-  new_user: newUserHandler,
   manual: manualHandler,
   /**
    * deep_scan — fetches ALL transactions for a partial wallet (no window limit).
+   * Auto-enqueued by WalletScanner when partial=true.
    */
   deep_scan: async (job) => {
     if (!job.walletId) {

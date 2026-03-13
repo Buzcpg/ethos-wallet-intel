@@ -7,6 +7,7 @@ export const profiles = pgTable('profiles', {
   externalProfileId: integer('external_profile_id').unique().notNull(),
   slug: text('slug'),
   displayName: text('display_name'),
+  primaryAddress: text('primary_address'),
   status: text('status').default('active'),
   createdAt: timestamp('created_at', { withTimezone: true }).default(sql`now()`),
   updatedAt: timestamp('updated_at', { withTimezone: true }).default(sql`now()`),

@@ -10,11 +10,6 @@ const envSchema = z.object({
   // H1 — number of jobs to process concurrently per poll tick
   WORKER_CONCURRENCY: z.coerce.number().int().positive().default(4),
   WEBHOOK_SECRET: z.string().optional(),
-  // Ethos API client settings
-  ETHOS_API_CONCURRENCY: z.coerce.number().int().positive().default(20),
-  ETHOS_API_SLEEP_MS: z.coerce.number().int().nonnegative().default(150),
-  ETHOS_API_BATCH_SIZE: z.coerce.number().int().positive().default(100),
-  ETHOS_API_MAX_RETRIES: z.coerce.number().int().positive().default(3),
   // Chain API keys (all optional — free tier works, just rate-limited more aggressively)
   ETHERSCAN_API_KEY: z.string().optional(),
   POLYGONSCAN_API_KEY: z.string().optional(),
@@ -45,7 +40,6 @@ const envSchema = z.object({
   // Number of hours between rescans; wallets scanned within this window are skipped
   RESCAN_INTERVAL_HOURS: z.coerce.number().int().positive().default(24),
   // Max consecutive 404s before stopping new profile ID probe (IDs have gaps)
-  NEW_USER_PROBE_MAX_MISSES: z.coerce.number().int().positive().default(200),
   // Max pages to fetch in a delta scan (only new transactions since last_scanned_block)
   SCAN_MAX_PAGES_DELTA: z.coerce.number().int().positive().default(10),
 });

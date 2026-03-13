@@ -4,7 +4,6 @@ import { env } from '../config/env.js';
 import healthRoutes from './routes/health.js';
 import statusRoutes from './routes/status.js';
 import jobRoutes from './routes/jobs.js';
-import syncRoutes from './routes/sync.js';
 import scannerRoutes from './routes/scanner.js';
 import rescanRoutes from './routes/rescan.js';
 import tasksRoutes from './routes/tasks.js';
@@ -41,7 +40,6 @@ app.use('*', async (c, next) => {
 app.route('/health', healthRoutes);
 app.route('/status', statusRoutes);
 app.route('/jobs', jobRoutes);
-app.route('/sync', syncRoutes);
 app.route('/scanner', scannerRoutes);
 app.route('/rescan', rescanRoutes);
 app.route('/tasks', tasksRoutes);
