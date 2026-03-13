@@ -40,18 +40,38 @@ function nativeCategories(chain: ChainSlug): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Known bridge/DEX contracts — skip when finding first funder
+// Known contract labels — classify funders (never skip; always store)
+// Confidence: EOA=1.0, cex=0.8, bridge=0.7, unknown_contract=0.6, dex=0.5
 // ---------------------------------------------------------------------------
 
-const KNOWN_CONTRACTS: Record<string, string> = {
-  '0x80c67432656d59144ceff962e8faf8926599bcf8': 'Orbiter Finance relay',
-  '0x99c9fc46f92e8a1c0dec1b1747d010903e884be1': 'Optimism bridge',
-  '0x49048044d57e1c92a77f79988d21fa8faf74e97e': 'Base bridge (L1Standard)',
-  '0x3154cf16ccdb4c6d922629664174b904d80f2c35': 'Base bridge (L1ERC20)',
-  '0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad': 'Uniswap Universal Router',
-  '0x2626664c2603336e57b271c5c0b26f421741e481': 'Uniswap V3 Router (Base)',
-  '0x6131b5fae19ea4f9d964eac0408e4408b66337b5': 'Kyberswap',
+export type FunderType = 'eoa' | 'bridge' | 'cex' | 'dex' | 'unknown_contract';
+
+interface FunderLabel { type: FunderType; name: string; confidence: number }
+
+const FUNDER_LABELS: Record<string, FunderLabel> = {
+  // Bridges — still valid first funder, traceable cross-chain
+  '0x80c67432656d59144ceff962e8faf8926599bcf8': { type: 'bridge', name: 'Orbiter Finance relay',      confidence: 0.7 },
+  '0x99c9fc46f92e8a1c0dec1b1747d010903e884be1': { type: 'bridge', name: 'Optimism gateway',           confidence: 0.7 },
+  '0x49048044d57e1c92a77f79988d21fa8faf74e97e': { type: 'bridge', name: 'Base bridge (L1Standard)',   confidence: 0.7 },
+  '0x3154cf16ccdb4c6d922629664174b904d80f2c35': { type: 'bridge', name: 'Base bridge (L1ERC20)',      confidence: 0.7 },
+  '0x4200000000000000000000000000000000000010': { type: 'bridge', name: 'Optimism L2 bridge',         confidence: 0.7 },
+  '0x4dbd4fc535ac27206064b68ffcf827b0a60bab3f': { type: 'bridge', name: 'Arbitrum inbox',             confidence: 0.7 },
+  '0x8484ef722627bf18ca5ae6bcf031c23e6e922b30': { type: 'bridge', name: 'Across protocol',            confidence: 0.7 },
+  // DEX routers — swap-funded; source wallet unclear, lowest signal
+  '0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad': { type: 'dex',    name: 'Uniswap Universal Router',  confidence: 0.5 },
+  '0x2626664c2603336e57b271c5c0b26f421741e481': { type: 'dex',    name: 'Uniswap V3 Router (Base)',   confidence: 0.5 },
+  '0x6131b5fae19ea4f9d964eac0408e4408b66337b5': { type: 'dex',    name: 'Kyberswap',                 confidence: 0.5 },
+  '0x1111111254eeb25477b68fb85ed929f73a960582': { type: 'dex',    name: '1inch v5',                   confidence: 0.5 },
+  // CEX hot wallets — useful clustering signal
+  '0x28c6c06298d514db089934071355e5743bf21d60': { type: 'cex',    name: 'Binance hot wallet',         confidence: 0.8 },
+  '0x21a31ee1afc51d94c2efccaa2092ad1028285549': { type: 'cex',    name: 'Binance cold wallet',        confidence: 0.8 },
+  '0xa9d1e08c7793af67e9d92fe308d5697fb81d3e43': { type: 'cex',    name: 'Coinbase',                   confidence: 0.8 },
+  '0x71660c4005ba85c37ccec55d0c4493e66fe775d3': { type: 'cex',    name: 'Coinbase 2',                 confidence: 0.8 },
 };
+
+function classifyFunder(address: string): FunderLabel {
+  return FUNDER_LABELS[address.toLowerCase()] ?? { type: 'eoa', name: '', confidence: 1.0 };
+}
 
 // ---------------------------------------------------------------------------
 // Stablecoins by chain for tier-2 first-funder fallback
@@ -270,6 +290,8 @@ function normalise(
 interface FirstFunderResult {
   transactions: RawTransaction[];
   confidence: number;
+  funderType: FunderType;
+  funderLabel: string;  // human-readable name, empty for EOA
 }
 
 // ---------------------------------------------------------------------------
@@ -408,28 +430,19 @@ export class AlchemyFetcher {
         if (tx) txs.push(tx);
       }
 
-      // Walk in order (asc = oldest first); skip known bridge/DEX contracts
-      let confidence = 0.5; // default: all funders were contracts
-      for (const t of rawNative) {
-        const fromLower = t.from.toLowerCase();
-        if (fromLower in KNOWN_CONTRACTS) {
-          if (env.LOG_LEVEL === 'debug') {
-            console.debug(`[alchemyFetcher] skip known contract: ${fromLower} (${KNOWN_CONTRACTS[fromLower]})`);
-          }
-          continue;
-        }
-        // Found an EOA funder
-        confidence = 1.0;
-        break;
+      // Classify the first (oldest) funder — never skip, always store
+      const firstFunder = rawNative[0]!;
+      const classification = classifyFunder(firstFunder.from);
+      if (env.LOG_LEVEL === 'debug') {
+        console.debug(`[alchemyFetcher] first funder: ${firstFunder.from} type=${classification.type} confidence=${classification.confidence}${classification.name ? ' (' + classification.name + ')' : ''}`);
       }
 
-      if (confidence < 1.0) {
-        if (env.LOG_LEVEL === 'debug') {
-          console.debug(`[alchemyFetcher] all native funders are known contracts — confidence 0.5`);
-        }
-      }
-
-      return { transactions: txs, confidence };
+      return {
+        transactions: txs,
+        confidence: classification.confidence,
+        funderType: classification.type,
+        funderLabel: classification.name,
+      };
     }
 
     // Tier 2: stablecoin fallback (only if tier 1 returned nothing)
@@ -456,21 +469,22 @@ export class AlchemyFetcher {
       if (tx) txs.push(tx);
     }
 
-    // Walk stablecoin results; EOA sender → confidence 0.8, all contracts → 0.5
-    let confidence = 0.5;
-    for (const t of rawStable) {
-      const fromLower = t.from.toLowerCase();
-      if (fromLower in KNOWN_CONTRACTS) {
-        if (env.LOG_LEVEL === 'debug') {
-          console.debug(`[alchemyFetcher] skip known contract (stable tier): ${fromLower} (${KNOWN_CONTRACTS[fromLower]})`);
-        }
-        continue;
-      }
-      confidence = 0.8;
-      break;
+    // Classify the first stablecoin funder — never skip
+    const firstStableFunder = rawStable[0]!;
+    const stableClass = classifyFunder(firstStableFunder.from);
+    // Stablecoin tier is inherently one step less certain than native ETH,
+    // so cap confidence at 0.7 even for EOAs
+    const stableConfidence = Math.min(stableClass.confidence, 0.7);
+    if (env.LOG_LEVEL === 'debug') {
+      console.debug(`[alchemyFetcher] first stable funder: ${firstStableFunder.from} type=${stableClass.type} confidence=${stableConfidence}`);
     }
 
-    return { transactions: txs, confidence };
+    return {
+      transactions: txs,
+      confidence: stableConfidence,
+      funderType: stableClass.type,
+      funderLabel: stableClass.name,
+    };
   }
 
   // ---------------------------------------------------------------------------
