@@ -8,7 +8,7 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
   WORKER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
   // H1 — number of jobs to process concurrently per poll tick
-  WORKER_CONCURRENCY: z.coerce.number().int().positive().default(5),
+  WORKER_CONCURRENCY: z.coerce.number().int().positive().default(4),
   WEBHOOK_SECRET: z.string().optional(),
   // Ethos API client settings
   ETHOS_API_CONCURRENCY: z.coerce.number().int().positive().default(20),
@@ -23,7 +23,8 @@ const envSchema = z.object({
   // Each key has its own 600/min budget — N keys = N× throughput per chain.
   // Create keys at each chain's Blockscout instance → My Account → API Keys
   BLOCKSCOUT_API_KEYS: z.string().optional(),
-  // Comma-separated chain slugs to skip in dequeue (e.g. 'avalanche' during peak hours)
+  BLOCKSCOUT_PRO_API_KEY: z.string().optional(), // multichain, Authorization: Bearer
+  // Comma-separated chain slugs to skip in dequeue (for maintenance/debugging)
   SKIP_CHAINS: z.string().optional(),
   // Supabase — profile ID enumeration (faster than Ethos API pagination)
   SUPABASE_URL: z.string().url().optional(),
