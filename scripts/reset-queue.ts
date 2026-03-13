@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { db as getDb } from '../src/db/client.js';
 import { walletScanJobs, wallets } from '../src/db/schema/index.js';
-import { eq, sql } from 'drizzle-orm';
+import { eq, sql, and } from 'drizzle-orm';
 
 const CHAIN = 'base';
 const BATCH_SIZE = 500;
@@ -12,7 +12,7 @@ async function main() {
   await db.execute(sql`TRUNCATE TABLE wallet_scan_jobs`);
 
   console.log('[queue] Loading primary wallets...');
-  const rows = await db.select({ id: wallets.id }).from(wallets).where(eq(wallets.isPrimary, true));
+  const rows = await db.select({ id: wallets.id }).from(wallets).where(and(eq(wallets.isPrimary, true), eq(wallets.chain, CHAIN)));
   console.log(`[queue] ${rows.length} primary wallets — enqueuing on ${CHAIN}...`);
 
   let inserted = 0;
