@@ -27,7 +27,6 @@ export interface SupabaseProfileRow {
   username: string | null;
   status: string | null;
   score: number | null;
-  userkeys: string[] | null;
   primary_address?: string | null;
 }
 
@@ -43,29 +42,19 @@ export interface SupabaseSyncStats {
 // ---------------------------------------------------------------------------
 
 /**
- * Parse EthosAddressData from a profiles_v2 row.
- * Uses primary_address column as source of truth for which wallet is primary.
- * Falls back to first address in userkeys if primary_address is null.
+ * Build EthosAddressData from profiles_v2.primary_address alone.
+ * No userkeys needed — primary_address is the single source of truth.
  */
-export function parseAddressesFromUserkeys(
-  userkeys: string[] | null | undefined,
-  primaryAddress?: string | null,
-): EthosAddressData {
-  const addresses = (userkeys ?? [])
-    .filter((k) => k.startsWith('address:'))
-    .map((k) => k.slice('address:'.length));
-
-  // primary_address column is source of truth; fall back to first userkey entry
-  const primary = primaryAddress?.toLowerCase() ?? null;
-  const resolvedPrimary = primary
-    ? (addresses.find(a => a.toLowerCase() === primary) ?? addresses[0] ?? null)
-    : (addresses[0] ?? null);
-
-  return {
-    primaryAddress: resolvedPrimary,
-    allAddresses: addresses,
-  };
+export function parseAddressesFromPrimary(primaryAddress?: string | null): EthosAddressData {
+  if (!primaryAddress) return { primaryAddress: null, allAddresses: [] };
+  return { primaryAddress: primaryAddress.toLowerCase(), allAddresses: [primaryAddress.toLowerCase()] };
 }
+
+// Legacy alias — kept for walletDriftChecker compatibility
+export const parseAddressesFromUserkeys = (
+  _userkeys: unknown,
+  primaryAddress?: string | null,
+) => parseAddressesFromPrimary(primaryAddress);
 
 /**
  * Map a Supabase profiles_v2 row to the EthosProfile shape expected by
@@ -78,7 +67,7 @@ export function toEthosProfile(row: SupabaseProfileRow): EthosProfile {
     username: row.username ?? null,
     status: (row.status as EthosProfile['status']) ?? 'ACTIVE',
     score: row.score ?? 0,
-    userkeys: row.userkeys ?? [],
+    userkeys: [],
   };
 }
 
@@ -121,9 +110,9 @@ export class SupabaseSync {
     // Upsert wallets per profile
     for (const row of rows) {
       try {
-        const addressData = parseAddressesFromUserkeys(row.userkeys, row.primary_address);
+        const addressData = parseAddressesFromPrimary(row.primary_address);
 
-        if (addressData.allAddresses.length === 0) {
+        if (!addressData.primaryAddress) {
           stats.skipped++;
           continue;
         }

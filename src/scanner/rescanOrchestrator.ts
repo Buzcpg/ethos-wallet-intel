@@ -195,7 +195,7 @@ export class RescanOrchestrator {
       const url = new URL(`${env.SUPABASE_URL}/rest/v1/profiles_v2`);
       url.searchParams.set(
         'select',
-        'raw_profile_id,display_name,username,status,score,userkeys,primary_address',
+        'raw_profile_id,display_name,username,status,score,primary_address',
       );
       url.searchParams.set('raw_profile_id', `gt.${highestSeen}`);
       url.searchParams.set('order', 'raw_profile_id.asc');

@@ -49,7 +49,7 @@ describe('toEthosProfile', () => {
       username: 'alice99',
       status: 'ACTIVE',
       score: 1234,
-      userkeys: ['address:0xABC', 'profileId:42'],
+      primary_address: '0xABC',
     };
     const p = toEthosProfile(row);
     expect(p.id).toBe(42);
@@ -57,7 +57,6 @@ describe('toEthosProfile', () => {
     expect(p.username).toBe('alice99');
     expect(p.status).toBe('ACTIVE');
     expect(p.score).toBe(1234);
-    expect(p.userkeys).toEqual(row.userkeys);
   });
 
   it('uses sensible defaults for null fields', () => {
@@ -67,14 +66,13 @@ describe('toEthosProfile', () => {
       username: null,
       status: null,
       score: null,
-      userkeys: null,
+      primary_address: null,
     };
     const p = toEthosProfile(row);
     expect(p.displayName).toBe('');
     expect(p.username).toBeNull();
     expect(p.status).toBe('ACTIVE');
     expect(p.score).toBe(0);
-    expect(p.userkeys).toEqual([]);
   });
 });
 
@@ -88,7 +86,7 @@ const makeRow = (id: number, addresses: string[]): SupabaseProfileRow => ({
   username: `user${id}`,
   status: 'ACTIVE',
   score: 100,
-  userkeys: [...addresses.map((a) => `address:${a}`), `profileId:${id}`],
+  primary_address: addresses[0] ?? null,
 });
 
 describe('SupabaseSync.ingestBatch', () => {
