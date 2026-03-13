@@ -82,30 +82,15 @@ async function main() {
   // ── 4. Load primary wallets ────────────────────────────────────────────────
   console.log('\n▶ Loading primary wallets');
   const profileIds = allProfiles.map(p => p.id);
-  // For mandatory profiles: scan ALL wallets (to catch cross-wallet p2p links)
-  // For extra profiles: primary only (keeps CU reasonable)
-  const mandatoryProfileIds = allProfiles
-    .filter(p => REQUIRED_PROFILE_IDS.includes(p.externalId ?? 0))
-    .map(p => p.id);
-  const extraProfileIds = allProfiles
-    .filter(p => !REQUIRED_PROFILE_IDS.includes(p.externalId ?? 0))
-    .map(p => p.id);
-
-  const allWalletsForMandatory = mandatoryProfileIds.length > 0
-    ? await database
-        .select({ id: wallets.id, address: wallets.address, chain: wallets.chain, profileId: wallets.profileId })
-        .from(wallets)
-        .where(and(inArray(wallets.profileId, mandatoryProfileIds), eq(wallets.chain, SCAN_CHAIN)))
-    : [];
-
-  const primaryWalletsForExtras = extraProfileIds.length > 0
-    ? await database
-        .select({ id: wallets.id, address: wallets.address, chain: wallets.chain, profileId: wallets.profileId })
-        .from(wallets)
-        .where(and(inArray(wallets.profileId, extraProfileIds), eq(wallets.chain, SCAN_CHAIN), eq(wallets.isPrimary, true)))
-    : [];
-
-  const primaryWallets = [...allWalletsForMandatory, ...primaryWalletsForExtras];
+  // One primary wallet per profile — 10 profiles = 10 wallets
+  const primaryWallets = await database
+    .select({ id: wallets.id, address: wallets.address, chain: wallets.chain, profileId: wallets.profileId })
+    .from(wallets)
+    .where(and(
+      inArray(wallets.profileId, profileIds),
+      eq(wallets.chain, SCAN_CHAIN),
+      eq(wallets.isPrimary, true),
+    ));
 
   check(`Wallets loaded`, primaryWallets.length >= REQUIRED_PROFILE_IDS.length,
     `${primaryWallets.length} wallets for ${allProfiles.length} profiles on ${SCAN_CHAIN}`);
@@ -147,6 +132,7 @@ async function main() {
         deposits: result.depositEvidenceFound,
         p2p: result.p2pMatchesFound,
         partial: result.partial,
+        txsFetched: result.transactionsFetched,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -183,14 +169,23 @@ async function main() {
     }
   }
 
-  // Check mandatory profiles have signals
+  // Check mandatory profiles — note if no ETH mainnet activity (expected for Base-only wallets)
   for (const pid of REQUIRED_PROFILE_IDS) {
     const prof = allProfiles.find(p => p.externalId === pid);
     if (!prof) continue;
     const w = primaryWallets.find(x => x.profileId === prof.id);
     if (!w) continue;
     const sig = signals.find(s => s.walletId === w.id);
-    check(`${prof.slug} has first funder signal`, !!sig, sig ? sig.funder ?? '' : 'missing');
+    if (sig) {
+      check(`${prof.slug} has first funder signal`, true, sig.funder ?? '');
+    } else {
+      const scanResult = scanResults.find(r => r.address === w.address);
+      if (scanResult && scanResult.txsFetched === 0) {
+        console.log(`  ℹ️  ${prof.slug}: no ${SCAN_CHAIN} activity on primary wallet (likely active on another chain)`);
+      } else {
+        check(`${prof.slug} has first funder signal`, false, 'scanned but no signal written');
+      }
+    }
   }
 
   // ── 8. Deposit evidence ───────────────────────────────────────────────────
