@@ -13,6 +13,18 @@ function nextApiKey(): string | undefined {
   return keys[_rotatorIdx++ % keys.length];
 }
 
+/**
+ * Returns the Authorization header for Blockscout PRO API.
+ * PRO key uses Bearer header; My Account keys use ?apikey= query param.
+ * PRO key is multichain; My Account key is per-chain-instance only.
+ */
+function proAuthHeader(): Record<string, string> {
+  const proKey = env.BLOCKSCOUT_PRO_API_KEY;
+  if (proKey) return { Authorization: `Bearer ${proKey}` };
+  // Fall back to no auth header (My Account key is added as query param separately)
+  return {};
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -107,11 +119,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithRetry(url: string, retries = 4, backoffMs = 1500): Promise<Response> {
+async function fetchWithRetry(url: string, retries = 4, backoffMs = 1500, extraHeaders: Record<string,string> = {}): Promise<Response> {
   let lastErr: Error = new Error('fetchWithRetry: no attempts made');
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, {
+        headers: extraHeaders,
+      });
       if (response.ok) return response;
 
       if (response.status === 429 || response.status === 503) {
@@ -219,17 +233,15 @@ async function fetchBlockscoutPage<T>(
   kind: 'transactions' | 'token-transfers',
   fixedParams: Record<string, string>,
   nextPageParams?: BlockscoutNextPage | null,
+  chain?: string,
 ): Promise<BlockscoutPage<T>> {
+  if (chain) await chainRateLimit(chain);
   const url = new URL(`${baseUrl}/addresses/${address}/${kind}`);
 
   // Fixed params first (address, sort, limit)
   for (const [k, v] of Object.entries(fixedParams)) {
     url.searchParams.set(k, v);
   }
-
-  // API key rotation — each key has its own rate limit bucket
-  const apiKey = nextApiKey();
-  if (apiKey) url.searchParams.set('apikey', apiKey);
 
   // next_page_params override/extend the fixed params
   if (nextPageParams) {
@@ -240,13 +252,23 @@ async function fetchBlockscoutPage<T>(
     }
   }
 
-  const response = await fetchWithRetry(url.toString());
+  const response = await fetchWithRetry(url.toString(), 4, 1500, proAuthHeader());
   return (await response.json()) as BlockscoutPage<T>;
 }
 
 // ---------------------------------------------------------------------------
 // WalletTransactionFetcher
 // ---------------------------------------------------------------------------
+
+// Per-chain rate limiter: ensures we don't exceed 1 req/sec per chain
+// (PRO free tier = 5 RPS total across all chains — 1/chain is safe)
+const _lastReqMs: Record<string, number> = {};
+async function chainRateLimit(chain: string, minGapMs = 1000): Promise<void> {
+  const last = _lastReqMs[chain] ?? 0;
+  const wait = minGapMs - (Date.now() - last);
+  if (wait > 0) await sleep(wait);
+  _lastReqMs[chain] = Date.now();
+}
 
 export class WalletTransactionFetcher {
   private readonly chain: ChainSlug;
@@ -444,7 +466,7 @@ export class WalletTransactionFetcher {
 
     while (pages < maxPages) {
       const page: BlockscoutPage<BlockscoutTx | BlockscoutTokenTransfer> = await fetchBlockscoutPage<BlockscoutTx | BlockscoutTokenTransfer>(
-        this.baseUrl, addr, kind, fixedParams, nextPage,
+        this.baseUrl, addr, kind, fixedParams, nextPage, this.chain,
       );
 
       for (const item of page.items ?? []) {
