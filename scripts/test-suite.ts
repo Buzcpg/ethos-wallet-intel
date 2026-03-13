@@ -1,28 +1,30 @@
 /**
- * ethos-wallet-intel test suite
- * ─────────────────────────────
- * Scans only buz_eth (#15) and serpinxbt (#8) primary wallets on ethereum.
- * Serial execution — no Promise.all over scans. ~4-8 API calls total.
+ * ethos-wallet-intel test suite — 10 wallets
+ * ────────────────────────────────────────────
+ * Mandatory: buz_eth (#15), serpinxbt (#8), EthosiansAgent (#24309)
+ * Plus 7 more early profiles. Primary wallets only, ethereum chain.
+ * Checks: first funder, deposit evidence, p2p matches, cross-wallet signals.
  *
  * Usage:  npx tsx scripts/test-suite.ts
- * Output: pass/fail per check, exit code 1 if any fail.
  */
 import { db as getDb } from '../src/db/client.js';
-import { profiles, wallets, firstFunderSignals } from '../src/db/schema/index.js';
+import { profiles, wallets, firstFunderSignals, walletMatches } from '../src/db/schema/index.js';
 import { WalletTransactionFetcher } from '../src/chains/transactionFetcher.js';
 import { WalletScanner } from '../src/scanner/walletScanner.js';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, inArray, or, sql } from 'drizzle-orm';
 import type { ChainSlug } from '../src/chains/index.js';
 
-// Only these two profiles, ethereum only — ~4-8 API calls total
-const REQUIRED_PROFILE_IDS = [15, 8]; // buz_eth, serpinxbt
+// ── 3 mandatory + 7 interesting early profiles ────────────────────────────
+const REQUIRED_PROFILE_IDS  = [15, 8, 24309];          // buz_eth, serpinxbt, EthosiansAgent
+const EXTRA_PROFILE_IDS     = [1, 2, 3, 6, 9, 32, 37]; // ethos, porkbus, workhorse, bluechilli, ak, roothlus, hildobby
+const ALL_PROFILE_IDS       = [...REQUIRED_PROFILE_IDS, ...EXTRA_PROFILE_IDS];
 const SCAN_CHAIN: ChainSlug = 'ethereum';
 
 let passed = 0;
 let failed = 0;
 
-function check(label: string, condition: boolean, detail = '') {
-  if (condition) {
+function check(label: string, ok: boolean, detail = '') {
+  if (ok) {
     console.log(`  ✅ ${label}${detail ? ' — ' + detail : ''}`);
     passed++;
   } else {
@@ -32,13 +34,13 @@ function check(label: string, condition: boolean, detail = '') {
 }
 
 async function main() {
-  console.log('\n═══════════════════════════════════════');
-  console.log('  ethos-wallet-intel test suite');
-  console.log('═══════════════════════════════════════\n');
+  console.log('\n═══════════════════════════════════════════');
+  console.log('  ethos-wallet-intel — 10-wallet test suite');
+  console.log('═══════════════════════════════════════════\n');
 
   const database = getDb();
 
-  // ── Step 1: DB connectivity ────────────────────────────────────────────────
+  // ── 1. DB connectivity ─────────────────────────────────────────────────────
   console.log('▶ DB connectivity');
   try {
     await database.execute(sql`SELECT 1 AS ok`);
@@ -48,137 +50,242 @@ async function main() {
     process.exit(1);
   }
 
-  // ── Step 2: Verify required profiles exist ─────────────────────────────────
-  console.log('\n▶ Profile existence');
-  const requiredProfiles = await database
+  // ── 2. Mandatory profiles exist ────────────────────────────────────────────
+  console.log('\n▶ Mandatory profiles');
+  const allProfiles = await database
     .select({ id: profiles.id, externalId: profiles.externalProfileId, slug: profiles.slug })
     .from(profiles)
-    .where(inArray(profiles.externalProfileId, REQUIRED_PROFILE_IDS));
+    .where(inArray(profiles.externalProfileId, ALL_PROFILE_IDS));
 
   for (const pid of REQUIRED_PROFILE_IDS) {
-    const found = requiredProfiles.find(p => p.externalId === pid);
+    const found = allProfiles.find(p => p.externalId === pid);
     check(`Profile #${pid} exists`, !!found, found ? `slug=${found.slug}` : 'MISSING');
   }
+  const optionalFound = allProfiles.filter(p => EXTRA_PROFILE_IDS.includes(p.externalId ?? 0));
+  console.log(`  Extra profiles found: ${optionalFound.length}/${EXTRA_PROFILE_IDS.length}`);
 
-  if (requiredProfiles.length === 0) {
-    console.error('\n💥 No required profiles found in DB — aborting.');
+  if (!allProfiles.some(p => REQUIRED_PROFILE_IDS.includes(p.externalId ?? 0))) {
+    console.error('\n💥 No mandatory profiles found — aborting.');
     process.exit(1);
   }
 
-  // ── Step 3: Raw API health check (one request on ethereum) ─────────────────
-  console.log('\n▶ Blockscout API health (ethereum only)');
-  const testAddr = '0x9a58c041255ca395a9cba41ab541e6dc8f3518bb';
+  // ── 3. API health check ────────────────────────────────────────────────────
+  console.log('\n▶ API health');
   try {
     const fetcher = new WalletTransactionFetcher(SCAN_CHAIN);
-    const result = await fetcher.fetchAll(testAddr);
-    check(`${SCAN_CHAIN} API responds`, true, `fetched ${result.totalFetched} txs for test address`);
+    const r = await fetcher.fetchAll('0x9a58c041255ca395a9cba41ab541e6dc8f3518bb');
+    check(`${SCAN_CHAIN} API responds`, true, `${r.totalFetched} txs for buz_eth`);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    check(`${SCAN_CHAIN} API responds`, false, msg);
+    check(`${SCAN_CHAIN} API responds`, false, err instanceof Error ? err.message : String(err));
   }
 
-  // ── Step 4: Scan primary wallets — serial, ethereum only ──────────────────
-  console.log('\n▶ Scanning primary wallets (ethereum, serial)');
+  // ── 4. Load primary wallets ────────────────────────────────────────────────
+  console.log('\n▶ Loading primary wallets');
+  const profileIds = allProfiles.map(p => p.id);
+  // For mandatory profiles: scan ALL wallets (to catch cross-wallet p2p links)
+  // For extra profiles: primary only (keeps CU reasonable)
+  const mandatoryProfileIds = allProfiles
+    .filter(p => REQUIRED_PROFILE_IDS.includes(p.externalId ?? 0))
+    .map(p => p.id);
+  const extraProfileIds = allProfiles
+    .filter(p => !REQUIRED_PROFILE_IDS.includes(p.externalId ?? 0))
+    .map(p => p.id);
 
-  // Load primary wallets for buz_eth and serpinxbt on ethereum only
-  const profileIds = requiredProfiles.map(p => p.id);
-  const primaryWallets = await database
-    .select({
-      id: wallets.id,
-      address: wallets.address,
-      chain: wallets.chain,
-      profileId: wallets.profileId,
-    })
-    .from(wallets)
-    .where(
-      and(
-        inArray(wallets.profileId, profileIds),
-        eq(wallets.chain, SCAN_CHAIN),
-        eq(wallets.isPrimary, true),
-      )
-    );
+  const allWalletsForMandatory = mandatoryProfileIds.length > 0
+    ? await database
+        .select({ id: wallets.id, address: wallets.address, chain: wallets.chain, profileId: wallets.profileId })
+        .from(wallets)
+        .where(and(inArray(wallets.profileId, mandatoryProfileIds), eq(wallets.chain, SCAN_CHAIN)))
+    : [];
 
-  console.log(`  Found ${primaryWallets.length} wallet(s) on ${SCAN_CHAIN} for ${requiredProfiles.length} profiles`);
+  const primaryWalletsForExtras = extraProfileIds.length > 0
+    ? await database
+        .select({ id: wallets.id, address: wallets.address, chain: wallets.chain, profileId: wallets.profileId })
+        .from(wallets)
+        .where(and(inArray(wallets.profileId, extraProfileIds), eq(wallets.chain, SCAN_CHAIN), eq(wallets.isPrimary, true)))
+    : [];
 
-  if (primaryWallets.length === 0) {
-    check('Primary wallets found on ethereum', false, 'no wallets found — check DB sync');
-    process.exit(1);
+  const primaryWallets = [...allWalletsForMandatory, ...primaryWalletsForExtras];
+
+  check(`Wallets loaded`, primaryWallets.length >= REQUIRED_PROFILE_IDS.length,
+    `${primaryWallets.length} wallets for ${allProfiles.length} profiles on ${SCAN_CHAIN}`);
+
+  if (primaryWallets.length === 0) process.exit(1);
+
+  console.log('  Wallet addresses in scan set:');
+  for (const w of primaryWallets) {
+    const p = allProfiles.find(x => x.id === w.profileId);
+    console.log(`    ${(p?.slug ?? '?').padEnd(20)} ${w.address}`);
   }
 
-  // Clear existing signals for a clean test run
+  // ── 5. Clear signals for clean run ────────────────────────────────────────
   const walletIds = primaryWallets.map(w => w.id);
   await database.delete(firstFunderSignals).where(inArray(firstFunderSignals.walletId, walletIds));
-  console.log('  Cleared existing signals for clean run');
+  await database.delete(walletMatches).where(
+    or(inArray(walletMatches.walletAId, walletIds), inArray(walletMatches.walletBId, walletIds))
+  );
+  console.log(`\n  Cleared existing signals for ${walletIds.length} wallets`);
 
+  // ── 6. Scan — serial, no concurrent calls ────────────────────────────────
+  console.log('\n▶ Scanning wallets (serial)');
   const scanner = new WalletScanner();
-  let scanned = 0;
+  const scanResults: Array<{ slug: string; address: string; firstFunder: boolean; deposits: number; p2p: number; partial: boolean }> = [];
   const errors: string[] = [];
 
-  // Serial scan — no Promise.all
   for (const w of primaryWallets) {
-    const profile = requiredProfiles.find(p => p.id === w.profileId);
-    const label = `${profile?.slug ?? w.profileId}@${w.chain}`;
-    console.log(`\n  Scanning ${label} (${w.address})`);
+    const p = allProfiles.find(x => x.id === w.profileId);
+    const label = `${p?.slug ?? w.profileId}`;
+    process.stdout.write(`  ${label.padEnd(22)} `);
 
     try {
       const result = await scanner.scanWallet(w.id, w.chain as ChainSlug);
-      console.log(`    txs fetched:      ${result.transactionsFetched}`);
-      console.log(`    first funder:     ${result.firstFunderFound ? '✅ found' : '— none'}`);
-      console.log(`    deposit evidence: ${result.depositEvidenceFound}`);
-      console.log(`    p2p matches:      ${result.p2pMatchesFound}`);
-      console.log(`    partial:          ${result.partial}`);
-      scanned++;
+      const partial = result.partial ? ' [partial]' : '';
+      process.stdout.write(`txs=${result.transactionsFetched} funder=${result.firstFunderFound ? '✅' : '—'} deposits=${result.depositEvidenceFound} p2p=${result.p2pMatchesFound}${partial}\n`);
+      scanResults.push({
+        slug: label, address: w.address,
+        firstFunder: result.firstFunderFound,
+        deposits: result.depositEvidenceFound,
+        p2p: result.p2pMatchesFound,
+        partial: result.partial,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      process.stdout.write(`❌ ${msg}\n`);
       errors.push(`${label}: ${msg}`);
-      console.error(`    ❌ error: ${msg}`);
     }
   }
 
-  check('All wallets scanned without errors', errors.length === 0,
-    errors.length > 0 ? errors.join('; ') : `${scanned}/${primaryWallets.length} scanned`);
+  check('All wallets scanned', errors.length === 0,
+    errors.length === 0 ? `${scanResults.length}/${primaryWallets.length} ok` : errors.join('; '));
 
-  // ── Step 5: Verify signals in DB ──────────────────────────────────────────
-  console.log('\n▶ Signal verification');
-
-  const signalCount = await database
-    .select({ count: sql<number>`COUNT(*)` })
+  // ── 7. First funder signals ───────────────────────────────────────────────
+  console.log('\n▶ First funder signals');
+  const signals = await database
+    .select({
+      walletId: firstFunderSignals.walletId,
+      funder: firstFunderSignals.funderAddress,
+      txHash: firstFunderSignals.txHash,
+      confidence: firstFunderSignals.confidence,
+      source: firstFunderSignals.source,
+    })
     .from(firstFunderSignals)
     .where(inArray(firstFunderSignals.walletId, walletIds));
 
-  const totalSignals = Number(signalCount[0]?.count ?? 0);
-  check('≥1 signal written to DB', totalSignals >= 1, `${totalSignals} signal(s) total`);
+  check('≥1 first funder signal written', signals.length >= 1, `${signals.length} total`);
 
-  // Per-profile signal breakdown
-  for (const profile of requiredProfiles) {
-    const profileWallets = primaryWallets.filter(w => w.profileId === profile.id);
-    if (profileWallets.length === 0) continue;
-
-    const signals = await database
-      .select({
-        chain: firstFunderSignals.chain,
-        funderAddress: firstFunderSignals.funderAddress,
-        txHash: firstFunderSignals.txHash,
-      })
-      .from(firstFunderSignals)
-      .where(inArray(firstFunderSignals.walletId, profileWallets.map(w => w.id)));
-
-    console.log(`\n  ${profile.slug ?? `#${profile.externalId}`} signals (${signals.length}):`);
-    for (const s of signals) {
-      console.log(`    ${s.chain}: first funder = ${s.funderAddress}`);
-      console.log(`             tx    = ${s.txHash}`);
+  for (const w of primaryWallets) {
+    const p = allProfiles.find(x => x.id === w.profileId);
+    const s = signals.find(x => x.walletId === w.id);
+    if (s) {
+      console.log(`  ${(p?.slug ?? '?').padEnd(20)} funder=${s.funder}  conf=${s.confidence}  via=${s.source}`);
+    } else {
+      console.log(`  ${(p?.slug ?? '?').padEnd(20)} — no first funder signal`);
     }
   }
 
-  // ── Summary ────────────────────────────────────────────────────────────────
-  console.log('\n═══════════════════════════════════════');
-  console.log(`  Results: ${passed} passed, ${failed} failed`);
-  console.log('═══════════════════════════════════════\n');
+  // Check mandatory profiles have signals
+  for (const pid of REQUIRED_PROFILE_IDS) {
+    const prof = allProfiles.find(p => p.externalId === pid);
+    if (!prof) continue;
+    const w = primaryWallets.find(x => x.profileId === prof.id);
+    if (!w) continue;
+    const sig = signals.find(s => s.walletId === w.id);
+    check(`${prof.slug} has first funder signal`, !!sig, sig ? sig.funder ?? '' : 'missing');
+  }
 
+  // ── 8. Deposit evidence ───────────────────────────────────────────────────
+  console.log('\n▶ Deposit evidence');
+  const totalDeposits = scanResults.reduce((sum, r) => sum + r.deposits, 0);
+  console.log(`  Total deposit evidence rows: ${totalDeposits}`);
+  const depositProfiles = scanResults.filter(r => r.deposits > 0);
+  if (depositProfiles.length > 0) {
+    for (const r of depositProfiles) {
+      console.log(`  ${r.slug.padEnd(22)} ${r.deposits} deposit evidence row(s)`);
+    }
+  } else {
+    console.log('  No deposit evidence found (wallets may not send to known CEX addresses)');
+  }
+
+  // ── 9. P2P matches ────────────────────────────────────────────────────────
+  console.log('\n▶ P2P matches');
+  const matches = await database
+    .select({
+      walletAId: walletMatches.walletAId,
+      walletBId: walletMatches.walletBId,
+      matchType: walletMatches.matchType,
+      matchKey: walletMatches.matchKey,
+      score: walletMatches.score,
+    })
+    .from(walletMatches)
+    .where(or(
+      inArray(walletMatches.walletAId, walletIds),
+      inArray(walletMatches.walletBId, walletIds),
+    ));
+
+  console.log(`  Total matches: ${matches.length}`);
+
+  if (matches.length > 0) {
+    for (const m of matches) {
+      const wa = primaryWallets.find(w => w.id === m.walletAId);
+      const wb = primaryWallets.find(w => w.id === m.walletBId);
+      const pa = allProfiles.find(p => p.id === wa?.profileId);
+      const pb = allProfiles.find(p => p.id === wb?.profileId);
+      console.log(`  ${(pa?.slug ?? '?').padEnd(20)} ↔ ${(pb?.slug ?? '?').padEnd(20)} type=${m.matchType} conf=${m.score}`);
+      console.log(`    key: ${m.matchKey}`);
+    }
+  } else {
+    console.log('  No p2p matches found between scanned wallets');
+  }
+
+  // Check specifically for buz ↔ EthosiansAgent match
+  const buzProf = allProfiles.find(p => p.externalId === 15);
+  const ethosProf = allProfiles.find(p => p.externalId === 24309);
+  const buzWallet = primaryWallets.find(w => w.profileId === buzProf?.id);
+  const ethosWallet = primaryWallets.find(w => w.profileId === ethosProf?.id);
+
+  if (buzWallet && ethosWallet) {
+    const buzEthosMatch = matches.find(m =>
+      (m.walletAId === buzWallet.id && m.walletBId === ethosWallet.id) ||
+      (m.walletAId === ethosWallet.id && m.walletBId === buzWallet.id)
+    );
+    if (buzEthosMatch) {
+      check('buz_eth ↔ EthosiansAgent p2p match found', true, `type=${buzEthosMatch.matchType}`);
+    } else {
+      console.log(`  ℹ️  buz_eth ↔ EthosiansAgent: no match on ${SCAN_CHAIN} — known link is on base (0x5f2da3 funded 0x84de46)`);
+    }
+  }
+
+  // ── 10. Shared funders (sybil signal) ────────────────────────────────────
+  console.log('\n▶ Shared funder check');
+  const funderCounts: Record<string, string[]> = {};
+  for (const s of signals) {
+    const w = primaryWallets.find(x => x.id === s.walletId);
+    const p = allProfiles.find(x => x.id === w?.profileId);
+    const funder = s.funder?.toLowerCase() ?? '';
+    if (!funder) continue;
+    if (!funderCounts[funder]) funderCounts[funder] = [];
+    funderCounts[funder].push(p?.slug ?? '?');
+  }
+
+  const sharedFunders = Object.entries(funderCounts).filter(([, slugs]) => slugs.length > 1);
+  if (sharedFunders.length > 0) {
+    console.log(`  ⚠️  ${sharedFunders.length} shared funder(s) found — potential sybil signal:`);
+    for (const [funder, slugs] of sharedFunders) {
+      console.log(`    ${funder}`);
+      console.log(`    funded: ${slugs.join(', ')}`);
+    }
+  } else {
+    console.log('  No shared funders across this wallet set');
+  }
+
+  // ── Summary ────────────────────────────────────────────────────────────────
+  console.log('\n═══════════════════════════════════════════');
+  console.log(`  Results: ${passed} passed, ${failed} failed`);
+  console.log('═══════════════════════════════════════════\n');
   process.exit(failed > 0 ? 1 : 0);
 }
 
 main().catch(err => {
-  console.error('\n💥 Test suite crashed:', err);
+  console.error('\n💥 Crashed:', err);
   process.exit(1);
 });
