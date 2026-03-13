@@ -12,7 +12,6 @@ function nextApiKey(): string | undefined {
   if (keys.length === 0) return undefined;
   return keys[_rotatorIdx++ % keys.length];
 }
-import { env } from '../config/env.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -88,13 +87,16 @@ interface BlockscoutPage<T> {
 // Blockscout chain config
 // ---------------------------------------------------------------------------
 
-const BLOCKSCOUT_CONFIGS: Record<string, { baseUrl: string }> = {
-  ethereum: { baseUrl: 'https://eth.blockscout.com/api/v2' },
-  base:     { baseUrl: 'https://base.blockscout.com/api/v2' },
-  arbitrum: { baseUrl: 'https://arbitrum.blockscout.com/api/v2' },
-  optimism: { baseUrl: 'https://optimism.blockscout.com/api/v2' },
-  polygon:  { baseUrl: 'https://polygon.blockscout.com/api/v2' },
-  avalanche: { baseUrl: 'https://api.snowtrace.io/api/v2/avalanche' },
+// Blockscout chain config
+// v2: cursor-based DESC pagination — used for recent tx window (deposit detection)
+// v1: Etherscan-compat API — supports sort=asc, used for first-funder detection
+const BLOCKSCOUT_CONFIGS: Record<string, { baseUrl: string; v1Url: string }> = {
+  ethereum: { baseUrl: 'https://eth.blockscout.com/api/v2', v1Url: 'https://eth.blockscout.com/api' },
+  base:     { baseUrl: 'https://base.blockscout.com/api/v2', v1Url: 'https://base.blockscout.com/api' },
+  arbitrum: { baseUrl: 'https://arbitrum.blockscout.com/api/v2', v1Url: 'https://arbitrum.blockscout.com/api' },
+  optimism: { baseUrl: 'https://optimism.blockscout.com/api/v2', v1Url: 'https://optimism.blockscout.com/api' },
+  polygon:  { baseUrl: 'https://polygon.blockscout.com/api/v2', v1Url: 'https://polygon.blockscout.com/api' },
+  // Avalanche removed — Snowtrace does not support Blockscout v1 compat API reliably
 };
 
 // ---------------------------------------------------------------------------
@@ -105,27 +107,25 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithRetry(url: string, retries = 5, backoffMs = 800): Promise<Response> {
+async function fetchWithRetry(url: string, retries = 4, backoffMs = 1500): Promise<Response> {
   let lastErr: Error = new Error('fetchWithRetry: no attempts made');
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const response = await fetch(url);
       if (response.ok) return response;
-      if (response.status === 422 || response.status === 404) {
-        // 422 = address has no transactions on this chain (totally normal for multi-chain wallets)
-        // 404 = address not found on this chain
-        // Return a sentinel so callers can treat it as empty rather than an error
-        return response;
-      }
-      if (response.status === 429) {
-        // Rate limited — exponential backoff (1.6s, 3.2s, 6.4s, 12.8s, 25.6s)
-        const wait = backoffMs * Math.pow(2, attempt);
+
+      if (response.status === 429 || response.status === 503) {
+        // 429 = rate limited, 503 = Blockscout instance down
+        const wait = backoffMs * Math.pow(2, attempt); // 1.5s, 3s, 6s, 12s
+        const label = response.status === 429 ? 'rate limited (429)' : 'service unavailable (503)';
+        console.warn(`[fetcher] ${label} — waiting ${Math.round(wait/1000)}s (attempt ${attempt+1}/${retries}): ${url.split('?')[0]}`);
         await sleep(wait);
-        lastErr = new Error(`Rate limited (429) after ${attempt + 1} attempts`);
+        lastErr = new Error(`${label} after ${attempt + 1} attempts`);
         continue;
       }
-      lastErr = new Error(`Blockscout API returned ${response.status}`);
-      if (attempt < retries - 1) await sleep(backoffMs);
+
+      // All other non-ok statuses are real errors — don't retry
+      throw new Error(`Blockscout returned ${response.status} for ${url.split('?')[0]}`);
     } catch (err) {
       lastErr = err instanceof Error ? err : new Error(String(err));
       if (attempt < retries - 1) await sleep(backoffMs);
@@ -241,10 +241,6 @@ async function fetchBlockscoutPage<T>(
   }
 
   const response = await fetchWithRetry(url.toString());
-  // 422/404 = no transactions for this address on this chain — return empty page
-  if (response.status === 422 || response.status === 404) {
-    return { items: [] } as BlockscoutPage<T>;
-  }
   return (await response.json()) as BlockscoutPage<T>;
 }
 
@@ -287,44 +283,40 @@ export class WalletTransactionFetcher {
   // ---------------------------------------------------------------------------
 
   private async fetchWindowed(addr: string): Promise<FetchResult> {
-    const windowFirst = env.SCAN_WINDOW_FIRST;
     const windowLast = env.SCAN_WINDOW_LAST;
+    const pagesLast  = Math.ceil(windowLast / 50);
 
-    const fixedParamsAsc  = { sort: 'asc',  limit: '50' };
-    const fixedParamsDesc = { sort: 'desc', limit: '50' };
-
-    const [
-      { txs: nativeFirst,  exhausted: nativeExhaustedFirst },
-      { txs: tokensFirst,  exhausted: tokensExhaustedFirst },
-      { txs: nativeLast,   exhausted: nativeExhaustedLast  },
-      { txs: tokensLast,   exhausted: tokensExhaustedLast  },
-    ] = await Promise.all([
-      this.fetchNPages(addr, 'transactions',   fixedParamsAsc,  Math.ceil(windowFirst / 50)),
-      this.fetchNPages(addr, 'token-transfers', fixedParamsAsc,  Math.ceil(windowFirst / 50)),
-      this.fetchNPages(addr, 'transactions',   fixedParamsDesc, Math.ceil(windowLast  / 50)),
-      this.fetchNPages(addr, 'token-transfers', fixedParamsDesc, Math.ceil(windowLast  / 50)),
+    // v2 API (DESC, newest first) — for recent tx window used by deposit detection
+    // NOTE: v2 API does NOT accept sort or limit params — omit them entirely
+    const [txsDescNative, txsDescTokens] = await Promise.all([
+      this.fetchNPages(addr, 'transactions',    {}, pagesLast),
+      this.fetchNPages(addr, 'token-transfers', {}, pagesLast),
     ]);
 
-    // H8 — a scan is partial if EITHER the first OR last window was capped
-    //      (was &&, now || — correct: partial if either window was truncated)
-    const windowCapped =
-      (!nativeExhaustedFirst || !tokensExhaustedFirst) ||
-      (!nativeExhaustedLast  || !tokensExhaustedLast);
+    // v1 compat API (ASC, oldest first) — for first-funder detection
+    const [txsAscNative, txsAscTokens] = await Promise.all([
+      this.fetchV1Oldest(addr, 'txlist',  env.SCAN_WINDOW_FIRST),
+      this.fetchV1Oldest(addr, 'tokentx', env.SCAN_WINDOW_FIRST),
+    ]);
 
-    const merged = this.dedup([...nativeFirst, ...tokensFirst, ...nativeLast, ...tokensLast]);
+    const merged = this.dedup([
+      ...txsAscNative.txs, ...txsAscTokens.txs,
+      ...txsDescNative.txs, ...txsDescTokens.txs,
+    ]);
 
-    const toBlock =
-      merged.length > 0
-        ? merged.reduce((max, tx) => (tx.blockNumber > max ? tx.blockNumber : max), 0n)
-        : undefined;
+    const partial = !txsDescNative.exhausted || !txsAscNative.exhausted;
+
+    const toBlock = merged.length > 0
+      ? merged.reduce((max, tx) => tx.blockNumber > max ? tx.blockNumber : max, 0n)
+      : undefined;
 
     return {
       transactions: merged,
       totalFetched: merged.length,
       chain: this.chain,
       address: addr,
+      partial,
       ...(toBlock !== undefined ? { toBlock } : {}),
-      partial: windowCapped,
     };
   }
 
@@ -333,28 +325,32 @@ export class WalletTransactionFetcher {
   // ---------------------------------------------------------------------------
 
   private async fetchDeepScan(addr: string): Promise<FetchResult> {
-    const fixedParams = { sort: 'asc', limit: '50' };
-    const delayMs = env.DEEP_SCAN_PAGE_DELAY_MS;
-
-    const [{ txs: nativeTxs }, { txs: tokenTxs }] = await Promise.all([
-      this.fetchNPages(addr, 'transactions',   fixedParams, Infinity, delayMs),
-      this.fetchNPages(addr, 'token-transfers', fixedParams, Infinity, delayMs),
+    // Full history: v2 DESC all pages + v1 ASC all pages, merged
+    const [descNative, descTokens] = await Promise.all([
+      this.fetchNPages(addr, 'transactions',    {}, Infinity),
+      this.fetchNPages(addr, 'token-transfers', {}, Infinity),
+    ]);
+    const [ascNative, ascTokens] = await Promise.all([
+      this.fetchV1Oldest(addr, 'txlist',  999999),
+      this.fetchV1Oldest(addr, 'tokentx', 999999),
     ]);
 
-    const merged = this.dedup([...nativeTxs, ...tokenTxs]);
+    const merged = this.dedup([
+      ...ascNative.txs, ...ascTokens.txs,
+      ...descNative.txs, ...descTokens.txs,
+    ]);
 
-    const toBlock =
-      merged.length > 0
-        ? merged.reduce((max, tx) => (tx.blockNumber > max ? tx.blockNumber : max), 0n)
-        : undefined;
+    const toBlock = merged.length > 0
+      ? merged.reduce((max, tx) => tx.blockNumber > max ? tx.blockNumber : max, 0n)
+      : undefined;
 
     return {
       transactions: merged,
       totalFetched: merged.length,
       chain: this.chain,
       address: addr,
-      ...(toBlock !== undefined ? { toBlock } : {}),
       partial: false,
+      ...(toBlock !== undefined ? { toBlock } : {}),
     };
   }
 
@@ -364,7 +360,8 @@ export class WalletTransactionFetcher {
 
   private async fetchFromBlock(addr: string, fromBlock: bigint): Promise<FetchResult> {
     const maxPages = env.SCAN_MAX_PAGES_DELTA;
-    const fixedParams = { sort: 'asc', limit: '50' };
+    // fetchFromBlock uses v1 compat API for ASC ordering
+    const fixedParams: Record<string,string> = {}; // v2: no sort/limit — use v1 for ASC
 
     const allTxs: RawTransaction[] = [];
     let nativeNextPage: BlockscoutNextPage | null = null;
@@ -469,6 +466,104 @@ export class WalletTransactionFetcher {
     }
 
     return { txs, exhausted: false };
+  }
+
+  /**
+   * fetchV1Oldest — uses Blockscout's Etherscan-compatible v1 API.
+   * Supports sort=asc (oldest first) — critical for first-funder detection.
+   * Returns up to maxTxs oldest transactions for this address.
+   * Falls back to empty on error (v1 API may not be available on all instances).
+   */
+  private async fetchV1Oldest(
+    addr: string,
+    action: 'txlist' | 'tokentx',
+    maxTxs: number,
+  ): Promise<{ txs: RawTransaction[]; exhausted: boolean }> {
+    const config = BLOCKSCOUT_CONFIGS[this.chain];
+    if (!config) return { txs: [], exhausted: true };
+
+    const pageSize = 50;
+    const pages = Math.ceil(maxTxs / pageSize);
+    const allTxs: RawTransaction[] = [];
+
+    for (let page = 1; page <= pages; page++) {
+      const url = new URL(config.v1Url);
+      url.searchParams.set('module', 'account');
+      url.searchParams.set('action', action);
+      url.searchParams.set('address', addr);
+      url.searchParams.set('sort', 'asc');
+      url.searchParams.set('page', String(page));
+      url.searchParams.set('offset', String(pageSize));
+      const apiKey = nextApiKey();
+      if (apiKey) url.searchParams.set('apikey', apiKey);
+
+      let data: { status: string; message: string; result: unknown };
+      try {
+        const response = await fetchWithRetry(url.toString());
+        data = await response.json() as typeof data;
+      } catch (err) {
+        console.warn(`[fetcher:v1:${this.chain}] ${action} failed for ${addr}:`, err instanceof Error ? err.message : err);
+        return { txs: allTxs, exhausted: false };
+      }
+
+      if (data.status !== '1') {
+        // status=0 + message=No transactions found is normal for inactive addresses
+        if (data.message?.includes('No transactions') || data.message?.includes('No records')) {
+          return { txs: allTxs, exhausted: true };
+        }
+        // Any other error (rate limit, API down) — log and bail
+        console.warn(`[fetcher:v1:${this.chain}] ${action} error for ${addr}: ${data.message}`);
+        return { txs: allTxs, exhausted: false };
+      }
+
+      const items = Array.isArray(data.result) ? data.result as Record<string, string>[] : [];
+
+      for (const item of items) {
+        // v1 compat format differs from v2 — map to RawTransaction
+        const blockNum = BigInt(item['blockNumber'] ?? '0');
+        const ts = new Date(Number(item['timeStamp'] ?? '0') * 1000);
+        if (isNaN(ts.getTime())) continue;
+
+        const lowerAddr = addr.toLowerCase();
+        const toAddr = (item['to'] ?? '').toLowerCase();
+        const fromAddr = (item['from'] ?? '').toLowerCase();
+
+        if (action === 'txlist') {
+          allTxs.push({
+            txHash: item['hash'] ?? '',
+            fromAddress: fromAddr,
+            toAddress: toAddr,
+            blockNumber: blockNum,
+            blockTimestamp: ts,
+            valueWei: item['value'] ?? '0',
+            isInbound: toAddr === lowerAddr,
+            chain: this.chain,
+          });
+        } else {
+          // tokentx
+          allTxs.push({
+            txHash: item['hash'] ?? '',
+            fromAddress: fromAddr,
+            toAddress: toAddr,
+            blockNumber: blockNum,
+            blockTimestamp: ts,
+            valueWei: '0',
+            tokenContractAddress: (item['contractAddress'] ?? '').toLowerCase(),
+            tokenSymbol: item['tokenSymbol'] ?? '',
+            tokenValueRaw: item['value'] ?? '0',
+            isInbound: toAddr === lowerAddr,
+            chain: this.chain,
+          });
+        }
+      }
+
+      // If we got fewer than pageSize, there are no more pages
+      if (items.length < pageSize) return { txs: allTxs, exhausted: true };
+
+      if (page < pages) await sleep(env.SCANNER_DELAY_MS);
+    }
+
+    return { txs: allTxs, exhausted: allTxs.length < maxTxs };
   }
 
   private dedup(txs: RawTransaction[]): RawTransaction[] {

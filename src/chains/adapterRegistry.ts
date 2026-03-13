@@ -6,7 +6,7 @@ import { BlockscoutAdapter, isBlockscoutChain } from './adapters/blockscout.js';
 // Blockscout first — free, no key needed, generous rate limits.
 // Etherscan fallback only for Avalanche (no confirmed Blockscout v2 instance for AVAX C-chain).
 // When a Blockscout instance for Avalanche is confirmed, move it here too.
-const ETHERSCAN_ONLY_CHAINS: ChainSlug[] = ['avalanche'];
+const ETHERSCAN_ONLY_CHAINS: ChainSlug[] = []; // Avalanche removed
 
 const adapterCache = new Map<ChainSlug, ChainAdapter>();
 
@@ -28,6 +28,6 @@ export function getAdapter(chain: ChainSlug): ChainAdapter {
 }
 
 export function getAllAdapters(): ChainAdapter[] {
-  const allChains: ChainSlug[] = ['ethereum', 'base', 'arbitrum', 'optimism', 'polygon', 'avalanche'];
+  const allChains: ChainSlug[] = ['ethereum', 'base', 'arbitrum', 'optimism', 'polygon'];
   return allChains.map((chain) => getAdapter(chain));
 }

@@ -33,7 +33,7 @@ export async function enqueueJob(
   return job;
 }
 
-interface RawJobRow {
+interface RawJobRow extends Record<string, unknown> {
   id: string;
   wallet_id: string | null;
   chain: string;

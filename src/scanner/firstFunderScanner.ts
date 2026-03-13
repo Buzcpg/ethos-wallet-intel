@@ -102,8 +102,6 @@ async function crossVerifyFunder(
   let htmlUrl: string;
   if (chain === 'ethereum') {
     htmlUrl = `https://etherscan.io/address/${walletAddress}`;
-  } else if (chain === 'avalanche') {
-    htmlUrl = `https://snowtrace.io/address/${walletAddress}`;
   } else {
     return { confidence: 0.9, source: 'computed' };
   }

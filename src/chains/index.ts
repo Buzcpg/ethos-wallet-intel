@@ -4,7 +4,6 @@ export const SUPPORTED_CHAINS = {
   arbitrum: { id: 42161, name: 'Arbitrum One', slug: 'arbitrum', nativeSymbol: 'ETH' },
   optimism: { id: 10, name: 'Optimism', slug: 'optimism', nativeSymbol: 'ETH' },
   polygon: { id: 137, name: 'Polygon', slug: 'polygon', nativeSymbol: 'POL' },
-  avalanche: { id: 43114, name: 'Avalanche', slug: 'avalanche', nativeSymbol: 'AVAX' },
 } as const;
 
 export type ChainSlug = keyof typeof SUPPORTED_CHAINS;
