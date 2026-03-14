@@ -1,18 +1,68 @@
-import { inArray, and, eq } from 'drizzle-orm';
+import { inArray, and, eq, inArray as inArrayAlias } from 'drizzle-orm';
 import { type Db, db as getDb } from '../db/client.js';
-import { depositTransferEvidence } from '../db/schema/index.js';
+import { depositTransferEvidence, addressLabels } from '../db/schema/index.js';
 import type { ChainSlug } from '../chains/index.js';
 import type { RawTransaction } from '../chains/transactionFetcher.js';
 import { CEX_SEED_LABELS } from '../labels/seedData.js';
 
 // ---------------------------------------------------------------------------
-// CEX address set — built from seedData, keyed by chain
+// In-memory CEX address cache — loaded once from DB, refreshed every 30 min
+// Falls back to CEX_SEED_LABELS if DB is empty or unreachable
 // ---------------------------------------------------------------------------
 
-const CEX_BY_CHAIN = new Map<string, Set<string>>();
-for (const label of CEX_SEED_LABELS) {
-  if (!CEX_BY_CHAIN.has(label.chain)) CEX_BY_CHAIN.set(label.chain, new Set());
-  CEX_BY_CHAIN.get(label.chain)!.add(label.address.toLowerCase());
+interface CexCache {
+  byChain: Map<string, Set<string>>;
+  loadedAt: number;
+}
+
+let _cache: CexCache | null = null;
+const CACHE_TTL_MS = 30 * 60 * 1000;
+
+async function getCexAddresses(chain: ChainSlug, database: Db): Promise<Set<string>> {
+  const now = Date.now();
+
+  if (_cache && now - _cache.loadedAt < CACHE_TTL_MS) {
+    return _cache.byChain.get(chain) ?? new Set();
+  }
+
+  // Reload from DB
+  try {
+    const rows = await database
+      .select({ chain: addressLabels.chain, address: addressLabels.address })
+      .from(addressLabels)
+      .where(eq(addressLabels.labelKind, 'exchange_hot_wallet'));
+
+    const byChain = new Map<string, Set<string>>();
+
+    // Seed with hardcoded bootstrap first
+    for (const label of CEX_SEED_LABELS) {
+      if (!byChain.has(label.chain)) byChain.set(label.chain, new Set());
+      byChain.get(label.chain)!.add(label.address.toLowerCase());
+    }
+
+    // Overlay with DB labels (may have more)
+    for (const row of rows) {
+      if (!byChain.has(row.chain)) byChain.set(row.chain, new Set());
+      byChain.get(row.chain)!.add(row.address.toLowerCase());
+    }
+
+    _cache = { byChain, loadedAt: now };
+
+    const total = [...byChain.values()].reduce((sum, s) => sum + s.size, 0);
+    console.log(`[DepositScanner] cache refreshed — ${total} CEX addresses across ${byChain.size} chains`);
+  } catch (err) {
+    console.error('[DepositScanner] cache load failed, using hardcoded fallback:', err);
+
+    // Fallback to hardcoded only
+    const byChain = new Map<string, Set<string>>();
+    for (const label of CEX_SEED_LABELS) {
+      if (!byChain.has(label.chain)) byChain.set(label.chain, new Set());
+      byChain.get(label.chain)!.add(label.address.toLowerCase());
+    }
+    _cache = { byChain, loadedAt: now };
+  }
+
+  return _cache.byChain.get(chain) ?? new Set();
 }
 
 // ---------------------------------------------------------------------------
@@ -38,8 +88,10 @@ export class DepositScanner {
   }
 
   /**
-   * Scan a wallet's outbound transactions for CEX deposit address interactions.
-   * Takes pre-fetched transactions to avoid redundant API calls.
+   * Scan a wallet's outbound transactions for deposits to known CEX hot wallets.
+   * Takes pre-fetched transactions — no additional API calls.
+   * CEX address list is loaded from address_labels DB (refreshed every 30min),
+   * with CEX_SEED_LABELS as hardcoded fallback.
    */
   async scanTransactions(
     walletId: string,
@@ -48,14 +100,12 @@ export class DepositScanner {
   ): Promise<DepositScanResult> {
     const database = this.getDbFn();
     const evidenceIds: string[] = [];
-    let depositsFound = 0;
 
-    const cexAddresses = CEX_BY_CHAIN.get(chain) ?? new Set<string>();
+    const cexAddresses = await getCexAddresses(chain, database);
     if (cexAddresses.size === 0) {
       return { walletId, chain, depositsFound: 0, evidenceIds: [] };
     }
 
-    // Outbound txs where toAddress is a known CEX hot wallet
     const cexTxs = transactions.filter(
       (tx) => !tx.isInbound && cexAddresses.has(tx.toAddress.toLowerCase()),
     );
@@ -66,7 +116,6 @@ export class DepositScanner {
 
     const txHashes = cexTxs.map((tx) => tx.txHash);
 
-    // Bulk idempotency check
     const existingRows = await database
       .select({ txHash: depositTransferEvidence.txHash, id: depositTransferEvidence.id })
       .from(depositTransferEvidence)
@@ -98,20 +147,14 @@ export class DepositScanner {
         )
         .returning({ id: depositTransferEvidence.id, txHash: depositTransferEvidence.txHash });
 
-      for (const row of inserted) {
-        evidenceIds.push(row.id);
-        depositsFound++;
-      }
+      for (const row of inserted) evidenceIds.push(row.id);
     }
 
     for (const tx of cexTxs) {
       const existingId = existingByHash.get(tx.txHash);
-      if (existingId) {
-        evidenceIds.push(existingId);
-        depositsFound++;
-      }
+      if (existingId) evidenceIds.push(existingId);
     }
 
-    return { walletId, chain, depositsFound, evidenceIds };
+    return { walletId, chain, depositsFound: evidenceIds.length, evidenceIds };
   }
 }
