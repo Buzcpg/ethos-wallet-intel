@@ -37,6 +37,7 @@ export function emitStreamEvent(event: Omit<MCEvent, "id" | "ts">): void {
     body: JSON.stringify(fullEvent),
     signal: controller.signal,
   })
+    .then(res => res.body?.cancel())
     .finally(() => clearTimeout(timeout))
     .catch(() => {});
 }

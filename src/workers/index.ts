@@ -34,10 +34,15 @@ async function runSlot(): Promise<void> {
 
     let walletAddr: string | undefined;
 
+    // Resolve wallet address independently — a DB blip here must not fail the job
     try {
       const [w] = await getDb().select({ address: wallets.address }).from(wallets).where(eq(wallets.id, job.walletId!)).limit(1);
       walletAddr = w?.address ?? (job.walletId?.slice(0, 8) ?? "unknown");
+    } catch {
+      walletAddr = job.walletId?.slice(0, 8) ?? "unknown";
+    }
 
+    try {
       emitStreamEvent({ type: "scan_start", wallet: walletAddr, chain: job.chain ?? undefined, meta: { jobType: job.jobType } });
 
       const stats = await handler(job);
