@@ -21,6 +21,8 @@ const envSchema = z.object({
   BLOCKSCOUT_PRO_API_KEY: z.string().optional(), // multichain, Authorization: Bearer
   ALCHEMY_API_KEY: z.string().min(1),
   DUNE_API_KEY: z.string().optional(),   // For targeted shared-funder label lookups post-backfill
+  MISSION_CONTROL_URL: z.string().url().optional(),
+  MISSION_CONTROL_SECRET: z.string().optional(),
   // Comma-separated chain slugs to skip in dequeue (for maintenance/debugging)
   SKIP_CHAINS: z.string().optional(),
   // Supabase — profile ID enumeration (faster than Ethos API pagination)

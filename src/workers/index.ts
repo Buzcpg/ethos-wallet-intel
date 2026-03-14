@@ -2,6 +2,10 @@ import { env } from '../config/env.js';
 import { dequeueNext, markDone, markFailed, resetStaleJobs } from '../queue/index.js';
 import { jobRegistry } from '../jobs/registry.js';
 import type { JobType } from '../jobs/types.js';
+import { emitStreamEvent } from '../lib/streamEmit.js';
+import { wallets } from '../db/schema/index.js';
+import { eq } from 'drizzle-orm';
+import { db as getDb } from '../db/client.js';
 
 const STALE_JOB_TIMEOUT_MS    = 10 * 60 * 1000; // 10 min — allow for deep_scan page delays
 const STALE_RESET_INTERVAL_MS =  5 * 60 * 1000;
@@ -28,13 +32,26 @@ async function runSlot(): Promise<void> {
       continue;
     }
 
+    let walletAddr: string | undefined;
+
     try {
+      const [w] = await getDb().select({ address: wallets.address }).from(wallets).where(eq(wallets.id, job.walletId!)).limit(1);
+      walletAddr = w?.address ?? (job.walletId?.slice(0, 8) ?? "unknown");
+
+      emitStreamEvent({ type: "scan_start", wallet: walletAddr, chain: job.chain ?? undefined, meta: { jobType: job.jobType } });
+
       const stats = await handler(job);
       await markDone(job.id, stats ?? undefined);
+
+      const s = stats as Record<string, unknown> | undefined;
+      emitStreamEvent({ type: "scan_complete", wallet: walletAddr, chain: job.chain ?? undefined, meta: { txsFetched: s?.transactionsFetched, firstFunderFound: s?.firstFunderFound, depositEvidenceFound: s?.depositEvidenceFound, p2pMatchesFound: s?.p2pMatchesFound, durationMs: s?.durationMs } });
+
+      if (s?.firstFunderFound) emitStreamEvent({ type: "wallet_found", wallet: walletAddr, chain: job.chain ?? undefined, meta: { signal: "first_funder" } });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[worker] job ${job.id} (${job.jobType}) failed: ${message}`);
       await markFailed(job.id, message);
+      emitStreamEvent({ type: "scan_error", wallet: walletAddr ?? "unknown", chain: job.chain ?? undefined, meta: { error: message } });
     }
   }
   activeSlots--;
