@@ -51,7 +51,7 @@ async function runSlot(): Promise<void> {
       const s = stats as Record<string, unknown> | undefined;
       emitStreamEvent({ type: "scan_complete", wallet: walletAddr, chain: job.chain ?? undefined, meta: { txsFetched: s?.transactionsFetched, firstFunderFound: s?.firstFunderFound, depositEvidenceFound: s?.depositEvidenceFound, p2pMatchesFound: s?.p2pMatchesFound, durationMs: s?.durationMs } });
 
-      if (s?.firstFunderFound) emitStreamEvent({ type: "wallet_found", wallet: walletAddr, chain: job.chain ?? undefined, meta: { signal: "first_funder" } });
+      if (s?.firstFunderFound) emitStreamEvent({ type: "wallet_found", wallet: walletAddr, chain: job.chain ?? undefined, meta: { signal: "first_funder", funderAddress: s?.funderAddress, txsFetched: s?.transactionsFetched } });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[worker] job ${job.id} (${job.jobType}) failed: ${message}`);

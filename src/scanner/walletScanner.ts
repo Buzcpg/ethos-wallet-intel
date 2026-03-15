@@ -33,6 +33,7 @@ export interface WalletScanResult {
   transactionsFetched: number;
   transactionsStored: number;
   firstFunderFound: boolean;
+  funderAddress?: string;
   depositEvidenceFound: number;
   p2pMatchesFound: number;
   partial: boolean;
@@ -198,6 +199,7 @@ export class WalletScanner {
         transactionsStored,
         partial: fetchResult.partial,
         firstFunderFound: firstFunderResult.found,
+        funderAddress: (firstFunderResult as { funderAddress?: string }).funderAddress,
         depositEvidenceFound: depositResult.depositsFound,
         p2pMatchesFound: p2pResult.matchesFound,
         durationMs: Date.now() - startMs,
