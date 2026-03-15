@@ -108,7 +108,7 @@ export class FirstFunderScanner {
     try {
       // Idempotency check
       const existing = await database
-        .select({ id: firstFunderSignals.id })
+        .select({ id: firstFunderSignals.id, funderAddress: firstFunderSignals.funderAddress })
         .from(firstFunderSignals)
         .where(
           and(
@@ -119,7 +119,7 @@ export class FirstFunderScanner {
         .limit(1);
 
       if (existing.length > 0) {
-        return { walletId, chain, found: true, skipped: true };
+        return { walletId, chain, found: true, skipped: true, funderAddress: existing[0].funderAddress ?? undefined };
       }
 
       // Find earliest inbound native tx from a different address
