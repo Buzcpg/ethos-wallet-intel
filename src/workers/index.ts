@@ -3,7 +3,7 @@ import { dequeueNext, markDone, markFailed, resetStaleJobs } from '../queue/inde
 import { jobRegistry } from '../jobs/registry.js';
 import type { JobType } from '../jobs/types.js';
 import { emitStreamEvent } from '../lib/streamEmit.js';
-import { wallets } from '../db/schema/index.js';
+import { wallets, profileScores } from '../db/schema/index.js';
 import { eq } from 'drizzle-orm';
 import { db as getDb, getPool } from '../db/client.js';
 
@@ -77,7 +77,17 @@ async function runSlot(): Promise<void> {
       jobsCompleted++;
 
       const s = stats as Record<string, unknown> | undefined;
-      emitStreamEvent({ type: "scan_complete", wallet: walletAddr, chain: job.chain ?? undefined, meta: { txsFetched: s?.transactionsFetched, firstFunderFound: s?.firstFunderFound, depositEvidenceFound: s?.depositEvidenceFound, p2pMatchesFound: s?.p2pMatchesFound, durationMs: s?.durationMs } });
+
+      let riskTier: string | undefined;
+      try {
+        const [w2] = await getDb().select({ profileId: wallets.profileId }).from(wallets).where(eq(wallets.id, job.walletId!)).limit(1);
+        if (w2?.profileId) {
+          const [ps] = await getDb().select({ riskTier: profileScores.riskTier }).from(profileScores).where(eq(profileScores.profileId, w2.profileId)).limit(1);
+          riskTier = ps?.riskTier ?? undefined;
+        }
+      } catch { /* never crash the worker */ }
+
+      emitStreamEvent({ type: "scan_complete", wallet: walletAddr, chain: job.chain ?? undefined, meta: { txsFetched: s?.transactionsFetched, firstFunderFound: s?.firstFunderFound, depositEvidenceFound: s?.depositEvidenceFound, p2pMatchesFound: s?.p2pMatchesFound, durationMs: s?.durationMs, riskTier } });
 
       if (s?.firstFunderFound) emitStreamEvent({ type: "wallet_found", wallet: walletAddr, chain: job.chain ?? undefined, meta: { signal: "first_funder", funderAddress: s?.funderAddress, txsFetched: s?.transactionsFetched } });
 

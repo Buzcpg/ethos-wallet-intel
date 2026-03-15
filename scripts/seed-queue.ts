@@ -1,7 +1,7 @@
 /**
  * seed-queue.ts — enqueue backfill jobs for all unscanned ethereum wallets
  *
- * Reads wallets seeded from Supabase profiles_v2 (chain='ethereum', lastScannedAt IS NULL)
+ * Reads wallets seeded from Supabase profiles_v2 for the target chain (CHAIN env var, default 'ethereum')
  * and bulk-inserts backfill jobs into wallet_scan_jobs.
  *
  * Idempotent: skips wallets that already have a pending or running job.
@@ -17,7 +17,7 @@ import { db as getDb } from '../src/db/client.js';
 import { wallets, walletScanJobs } from '../src/db/schema/index.js';
 import { isNull, eq, and, inArray, sql } from 'drizzle-orm';
 
-const CHAIN = 'ethereum';
+const CHAIN = (process.env.CHAIN as 'ethereum' | 'base' | 'arbitrum' | 'optimism' | 'polygon') ?? 'ethereum';
 const BATCH_SIZE = 500;
 
 const args = process.argv.slice(2);
