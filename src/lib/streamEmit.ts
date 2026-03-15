@@ -3,7 +3,7 @@
 
 import { env } from '../config/env.js';
 
-export type MCEventType = "scan_start" | "scan_complete" | "wallet_found" | "scan_error" | "info";
+export type MCEventType = "scan_start" | "scan_complete" | "wallet_found" | "scan_error" | "info" | "stats";
 
 export interface MCEvent {
   id: string;       // crypto.randomUUID()

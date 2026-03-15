@@ -3,6 +3,7 @@ import { dequeueNext, markDone, markFailed, resetStaleJobs } from '../queue/inde
 import { jobRegistry } from '../jobs/registry.js';
 import type { JobType } from '../jobs/types.js';
 import { emitStreamEvent } from '../lib/streamEmit.js';
+import { sql } from 'drizzle-orm';
 import { wallets } from '../db/schema/index.js';
 import { eq } from 'drizzle-orm';
 import { db as getDb } from '../db/client.js';
@@ -11,6 +12,9 @@ const STALE_JOB_TIMEOUT_MS    = 10 * 60 * 1000; // 10 min — allow for deep_sca
 const STALE_RESET_INTERVAL_MS =  5 * 60 * 1000;
 
 let running = false;
+let jobsCompleted = 0;
+let lastStatEmit = 0;
+const STAT_EMIT_INTERVAL_MS = 15_000; // emit stats at most once per 15s
 let shutdownRequested = false;
 let activeSlots = 0;
 let staleResetTimer: ReturnType<typeof setInterval> | null = null;
@@ -47,11 +51,55 @@ async function runSlot(): Promise<void> {
 
       const stats = await handler(job);
       await markDone(job.id, stats ?? undefined);
+      jobsCompleted++;
 
       const s = stats as Record<string, unknown> | undefined;
       emitStreamEvent({ type: "scan_complete", wallet: walletAddr, chain: job.chain ?? undefined, meta: { txsFetched: s?.transactionsFetched, firstFunderFound: s?.firstFunderFound, depositEvidenceFound: s?.depositEvidenceFound, p2pMatchesFound: s?.p2pMatchesFound, durationMs: s?.durationMs } });
 
       if (s?.firstFunderFound) emitStreamEvent({ type: "wallet_found", wallet: walletAddr, chain: job.chain ?? undefined, meta: { signal: "first_funder", funderAddress: s?.funderAddress, txsFetched: s?.transactionsFetched } });
+
+      // Emit live stats periodically
+      const now = Date.now();
+      if (now - lastStatEmit > STAT_EMIT_INTERVAL_MS) {
+        lastStatEmit = now;
+        try {
+          const db = getDb();
+          const [jobStats] = await db.execute(sql`
+            SELECT
+              COUNT(*) FILTER (WHERE status = 'done')    AS total_done,
+              COUNT(*) FILTER (WHERE status = 'pending') AS total_pending,
+              COUNT(*) FILTER (WHERE status = 'running') AS total_running,
+              COUNT(*) FILTER (WHERE status = 'failed')  AS total_failed
+            FROM wallet_scan_jobs
+          `) as unknown as Array<Record<string, unknown>>;
+          const [sigStats] = await db.execute(sql`
+            SELECT COUNT(*) AS total_flagged, COUNT(DISTINCT funder_address) AS unique_funders
+            FROM first_funder_signals
+          `) as unknown as Array<Record<string, unknown>>;
+
+          const totalDone    = Number(jobStats?.total_done    ?? 0);
+          const totalPending = Number(jobStats?.total_pending ?? 0);
+          const totalRunning = Number(jobStats?.total_running ?? 0);
+          const totalFlagged = Number(sigStats?.total_flagged ?? 0);
+          const uniqueFunders = Number(sigStats?.unique_funders ?? 0);
+          const clearRate = totalDone > 0
+            ? Math.round(((totalDone - totalFlagged) / totalDone) * 100)
+            : 0;
+
+          emitStreamEvent({
+            type: "stats",
+            meta: {
+              totalScanned: totalDone,
+              totalPending,
+              activeScans: totalRunning,
+              totalFlagged,
+              uniqueFunders,
+              clearRate,
+              idle: totalPending === 0 && totalRunning === 0,
+            },
+          });
+        } catch { /* stats emit failure must never crash the worker */ }
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[worker] job ${job.id} (${job.jobType}) failed: ${message}`);
