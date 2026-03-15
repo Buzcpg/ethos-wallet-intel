@@ -3,10 +3,9 @@ import { dequeueNext, markDone, markFailed, resetStaleJobs } from '../queue/inde
 import { jobRegistry } from '../jobs/registry.js';
 import type { JobType } from '../jobs/types.js';
 import { emitStreamEvent } from '../lib/streamEmit.js';
-import { sql } from 'drizzle-orm';
 import { wallets } from '../db/schema/index.js';
 import { eq } from 'drizzle-orm';
-import { db as getDb } from '../db/client.js';
+import { db as getDb, getPool } from '../db/client.js';
 
 const STALE_JOB_TIMEOUT_MS    = 10 * 60 * 1000; // 10 min — allow for deep_scan page delays
 const STALE_RESET_INTERVAL_MS =  5 * 60 * 1000;
@@ -63,25 +62,24 @@ async function runSlot(): Promise<void> {
       if (now - lastStatEmit > STAT_EMIT_INTERVAL_MS) {
         lastStatEmit = now;
         try {
-          const db = getDb();
-          const [jobStats] = await db.execute(sql`
-            SELECT
+          const pool = getPool();
+          const client = await pool.connect();
+          let totalDone = 0, totalPending = 0, totalRunning = 0, totalFlagged = 0, uniqueFunders = 0;
+          try {
+            const jobRes = await client.query(`SELECT
               COUNT(*) FILTER (WHERE status = 'done')    AS total_done,
               COUNT(*) FILTER (WHERE status = 'pending') AS total_pending,
-              COUNT(*) FILTER (WHERE status = 'running') AS total_running,
-              COUNT(*) FILTER (WHERE status = 'failed')  AS total_failed
-            FROM wallet_scan_jobs
-          `) as unknown as Array<Record<string, unknown>>;
-          const [sigStats] = await db.execute(sql`
-            SELECT COUNT(*) AS total_flagged, COUNT(DISTINCT funder_address) AS unique_funders
-            FROM first_funder_signals
-          `) as unknown as Array<Record<string, unknown>>;
-
-          const totalDone    = Number(jobStats?.total_done    ?? 0);
-          const totalPending = Number(jobStats?.total_pending ?? 0);
-          const totalRunning = Number(jobStats?.total_running ?? 0);
-          const totalFlagged = Number(sigStats?.total_flagged ?? 0);
-          const uniqueFunders = Number(sigStats?.unique_funders ?? 0);
+              COUNT(*) FILTER (WHERE status = 'running') AS total_running
+              FROM wallet_scan_jobs`);
+            const sigRes = await client.query(`SELECT COUNT(*) AS total_flagged, COUNT(DISTINCT funder_address) AS unique_funders FROM first_funder_signals`);
+            const jr = jobRes.rows[0] ?? {};
+            const sr = sigRes.rows[0] ?? {};
+            totalDone    = Number(jr.total_done    ?? 0);
+            totalPending = Number(jr.total_pending ?? 0);
+            totalRunning = Number(jr.total_running ?? 0);
+            totalFlagged = Number(sr.total_flagged ?? 0);
+            uniqueFunders = Number(sr.unique_funders ?? 0);
+          } finally { client.release(); }
           const clearRate = totalDone > 0
             ? Math.round(((totalDone - totalFlagged) / totalDone) * 100)
             : 0;
