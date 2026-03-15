@@ -3,7 +3,7 @@ import { db as getDb } from '../src/db/client.js';
 import { walletScanJobs, wallets } from '../src/db/schema/index.js';
 import { eq, sql, and } from 'drizzle-orm';
 
-const CHAIN = 'base';
+const CHAIN = 'ethereum';
 const BATCH_SIZE = 500;
 
 async function main() {
@@ -19,7 +19,7 @@ async function main() {
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const batch = rows.slice(i, i + BATCH_SIZE);
     await db.insert(walletScanJobs).values(batch.map(w => ({
-      walletId: w.id, chain: CHAIN, jobType: 'new_user', status: 'pending' as const,
+      walletId: w.id, chain: CHAIN, jobType: 'backfill', status: 'pending' as const,
     })));
     inserted += batch.length;
     if (inserted % 5000 === 0 || inserted === rows.length) console.log(`[queue] ${inserted}/${rows.length}`);

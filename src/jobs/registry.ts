@@ -1,100 +1,62 @@
 import type { JobHandler, JobType } from './types.js';
 import type { ChainSlug } from '../chains/index.js';
-import { db } from '../db/client.js';
 import { WalletScanner } from '../scanner/walletScanner.js';
 import { isValidChain } from '../chains/index.js';
-import { markFailed } from '../queue/index.js';
+import { enqueueJob } from '../queue/index.js';
 
 // ---------------------------------------------------------------------------
-// Handlers
+// Handlers — each returns scan stats for persistence to stats_json
 // ---------------------------------------------------------------------------
 
-/**
- * backfill — full three-signal scan via WalletScanner.
- * Single tx fetch, all extractors in parallel.
- */
 const backfillHandler: JobHandler = async (job) => {
-  if (!job.walletId) {
-    console.warn('[backfill] Job missing walletId, skipping');
-    return;
-  }
-  if (!isValidChain(job.chain)) {
-    console.warn(`[backfill] Invalid chain "${job.chain}", skipping`);
-    return;
-  }
+  if (!job.walletId) throw new Error('Job missing walletId');
+  if (!isValidChain(job.chain)) throw new Error(`Invalid chain: ${job.chain}`);
 
-  console.log(`[backfill] full scan — wallet ${job.walletId} on ${job.chain}`);
   const scanner = new WalletScanner();
   const result = await scanner.scanWallet(job.walletId, job.chain);
-  console.log(`[backfill] result:`, result);
+
+  if (result.error) throw new Error(result.error);
+
+  // Auto-enqueue deep_scan for wallets where windowed scan was truncated
+  if (result.partial) {
+    await enqueueJob(job.walletId, job.chain as ChainSlug, 'deep_scan').catch((err: unknown) => {
+      console.warn(`[backfill] failed to enqueue deep_scan for ${job.walletId}:`, err);
+    });
+  }
+
+  return result as unknown as Record<string, unknown>;
 };
 
-/**
- * delta — fetch only transactions since lastScannedBlock, run all three
- * extractors on new data. Falls back to full scan for first-time wallets.
- */
 const deltaHandler: JobHandler = async (job) => {
-  if (!job.walletId) {
-    console.warn('[delta] Job missing walletId, skipping');
-    return;
-  }
-  if (!isValidChain(job.chain)) {
-    console.warn(`[delta] Invalid chain "${job.chain}", skipping`);
-    return;
-  }
+  if (!job.walletId) throw new Error('Job missing walletId');
+  if (!isValidChain(job.chain)) throw new Error(`Invalid chain: ${job.chain}`);
 
-  console.log(`[delta] delta scan — wallet ${job.walletId} on ${job.chain}`);
   const scanner = new WalletScanner();
   const result = await scanner.deltaScanWallet(job.walletId, job.chain);
-  console.log(`[delta] result:`, result);
+  return result as unknown as Record<string, unknown>;
 };
 
-/**
- * new_user — full scan for a newly synced wallet.
- */
-const newUserHandler: JobHandler = async (job) => {
-  if (!job.walletId || !isValidChain(job.chain)) {
-    console.warn('[new_user] invalid job, skipping');
-    return;
-  }
-  console.log(`[new_user] full scan — wallet ${job.walletId} on ${job.chain}`);
-  const scanner = new WalletScanner();
-  await scanner.scanWallet(job.walletId, job.chain);
-};
-
-/**
- * manual — full scan triggered via API.
- */
 const manualHandler: JobHandler = async (job) => {
-  if (!job.walletId || !isValidChain(job.chain)) {
-    console.warn('[manual] invalid job, skipping');
-    return;
-  }
-  console.log(`[manual] full scan — wallet ${job.walletId} on ${job.chain}`);
+  if (!job.walletId) throw new Error('Job missing walletId');
+  if (!isValidChain(job.chain)) throw new Error(`Invalid chain: ${job.chain}`);
+
   const scanner = new WalletScanner();
-  await scanner.scanWallet(job.walletId, job.chain);
+  const result = await scanner.scanWallet(job.walletId, job.chain);
+  return result as unknown as Record<string, unknown>;
+};
+
+const deepScanHandler: JobHandler = async (job) => {
+  if (!job.walletId) throw new Error('Job missing walletId');
+  if (!isValidChain(job.chain)) throw new Error(`Invalid chain: ${job.chain}`);
+
+  const scanner = new WalletScanner();
+  const result = await scanner.scanWallet(job.walletId, job.chain as ChainSlug, { deepScan: true });
+  return result as unknown as Record<string, unknown>;
 };
 
 export const jobRegistry: Record<JobType, JobHandler> = {
   backfill: backfillHandler,
   delta: deltaHandler,
-  new_user: newUserHandler,
   manual: manualHandler,
-  /**
-   * deep_scan — fetches ALL transactions for a partial wallet (no window limit).
-   */
-  deep_scan: async (job) => {
-    if (!job.walletId) {
-      console.warn('[deep_scan] Job missing walletId, skipping');
-      return;
-    }
-    if (!isValidChain(job.chain)) {
-      console.warn(`[deep_scan] Invalid chain "${job.chain}", marking job failed`);
-      await markFailed(job.id, `Invalid chain: ${job.chain}`);
-      return;
-    }
-    console.log(`[deep_scan] full tx history — wallet ${job.walletId} on ${job.chain}`);
-    const scanner = new WalletScanner(db);
-    await scanner.scanWallet(job.walletId, job.chain as ChainSlug, { deepScan: true });
-  },
+  deep_scan: deepScanHandler,
 };

@@ -13,7 +13,7 @@ const backfillSchema = z.object({
 const scanWalletSchema = z.object({
   walletId: z.string().uuid(),
   chain: z.string().refine(isValidChain, { message: 'Invalid chain' }),
-  type: z.enum(['manual', 'delta', 'new_user', 'backfill']).default('manual'),
+  type: z.enum(['manual', 'delta', 'backfill']).default('manual'),
 });
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

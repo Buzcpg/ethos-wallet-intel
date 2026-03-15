@@ -1,7 +1,8 @@
 import { eq, and, isNull, lt, or, sql, count } from 'drizzle-orm';
 import { type Db, db as getDb } from '../db/client.js';
-import { wallets } from '../db/schema/index.js';
+import { wallets, walletTransactions } from '../db/schema/index.js';
 import type { ChainSlug } from '../chains/index.js';
+import type { RawTransaction } from '../chains/transactionFetcher.js';
 import { WalletTransactionFetcher } from '../chains/transactionFetcher.js';
 import { FirstFunderScanner } from './firstFunderScanner.js';
 import { DepositScanner } from './depositScanner.js';
@@ -9,29 +10,33 @@ import { P2PScanner } from './p2pScanner.js';
 import { env } from '../config/env.js';
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Hard cap: never store more than this many transactions per wallet */
+const TX_STORE_CAP = 5_000;
+/** Batch size for wallet_transactions inserts */
+const TX_INSERT_BATCH = 500;
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export interface WalletScanOptions {
-  /** If true, fetch ALL transactions (overrides window strategy). Used by deep_scan jobs. */
+  /** Fetch ALL transactions — no page cap. Used for deep_scan jobs. */
   deepScan?: boolean;
 }
-
-export type DeepScanReason =
-  | 'gap_in_history'          // first+last window has an uncovered middle
-  | 'no_deposits_in_window';  // no CEX deposits found in window — may be in the middle
 
 export interface WalletScanResult {
   walletId: string;
   chain: ChainSlug;
   transactionsFetched: number;
+  transactionsStored: number;
   firstFunderFound: boolean;
+  funderAddress?: string;
   depositEvidenceFound: number;
   p2pMatchesFound: number;
-  /** true if a deep_scan job should be queued for this wallet */
   partial: boolean;
-  /** reasons why a deep_scan was flagged (empty if partial=false) */
-  deepScanReasons: DeepScanReason[];
   durationMs: number;
   error?: string;
 }
@@ -42,6 +47,7 @@ export interface BatchScanResult {
   skipped: number;
   errors: number;
   totalTransactionsFetched: number;
+  totalTransactionsStored: number;
   totalFirstFundersFound: number;
   totalDepositEvidenceFound: number;
   totalP2PMatchesFound: number;
@@ -66,104 +72,134 @@ export class WalletScanner {
     this.p2pScanner = new P2PScanner(dbFn);
   }
 
-  /**
-   * Full scan: fetch all transactions once, run all three extractors in parallel.
-   * Each extractor is idempotent (upserts/conflict handling), so repeated runs are safe.
-   */
+  // ---------------------------------------------------------------------------
+  // Transaction store (5k cap, batched, idempotent)
+  // ---------------------------------------------------------------------------
+
+  private async storeTransactions(
+    walletId: string,
+    chain: ChainSlug,
+    txs: RawTransaction[],
+    database: Db,
+  ): Promise<number> {
+    if (txs.length === 0) return 0;
+
+    // Count existing rows for this wallet
+    const existingRows = await database
+      .select({ existing: count() })
+      .from(walletTransactions)
+      .where(eq(walletTransactions.walletId, walletId));
+
+    const existingCount = Number(existingRows[0]?.existing ?? 0);
+
+    if (existingCount >= TX_STORE_CAP) {
+      console.log(`[TxStore] ${walletId} already at ${TX_STORE_CAP} cap, skipping`);
+      return 0;
+    }
+
+    const slots = TX_STORE_CAP - existingCount;
+    const toStore = txs.slice(0, slots);
+
+    const rows = toStore.map((tx) => ({
+      walletId,
+      chain,
+      txHash: tx.txHash,
+      blockNumber: tx.blockNumber !== undefined ? BigInt(tx.blockNumber) : null,
+      blockTimestamp: tx.blockTimestamp ?? null,
+      direction: tx.isInbound ? 'inbound' : 'outbound',
+      counterpartyAddress: (tx.isInbound ? tx.fromAddress : tx.toAddress).toLowerCase(),
+      valueWei: tx.valueWei ?? null,
+      tokenSymbol: tx.tokenSymbol ?? null,
+      tokenContractAddress: tx.tokenContractAddress ?? null,
+      isErc20: !!tx.tokenContractAddress,
+    }));
+
+    let inserted = 0;
+    for (let i = 0; i < rows.length; i += TX_INSERT_BATCH) {
+      const batch = rows.slice(i, i + TX_INSERT_BATCH);
+      const result = await database
+        .insert(walletTransactions)
+        .values(batch)
+        .onConflictDoNothing()
+        .returning({ id: walletTransactions.id });
+      inserted += result.length;
+    }
+
+    return inserted;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Full scan
+  // ---------------------------------------------------------------------------
+
   async scanWallet(walletId: string, chain: ChainSlug, opts?: WalletScanOptions): Promise<WalletScanResult> {
     const startMs = Date.now();
     const database = this.getDbFn();
 
     try {
-      // 1. Get wallet address
       const [wallet] = await database
-        .select({ address: wallets.address, lastScannedAt: wallets.lastScannedAt })
+        .select({ address: wallets.address })
         .from(wallets)
         .where(eq(wallets.id, walletId))
         .limit(1);
 
       if (!wallet) {
         return {
-          walletId,
-          chain,
-          transactionsFetched: 0,
-          firstFunderFound: false,
-          depositEvidenceFound: 0,
-          p2pMatchesFound: 0,
-          partial: false,
-          deepScanReasons: [],
-          durationMs: Date.now() - startMs,
+          walletId, chain,
+          transactionsFetched: 0, transactionsStored: 0,
+          firstFunderFound: false, depositEvidenceFound: 0, p2pMatchesFound: 0,
+          partial: false, durationMs: Date.now() - startMs,
           error: `Wallet ${walletId} not found`,
         };
       }
 
-      // 2. Fetch ALL transactions (single pass)
       const fetcher = new WalletTransactionFetcher(chain);
       const fetchResult = await fetcher.fetchAll(wallet.address, opts?.deepScan ? { deepScan: true } : undefined);
       const { transactions } = fetchResult;
 
-      // 3. Run all three extractors in parallel on the same data
+      // Store transactions first (before extractors, so failed extractors don't lose data)
+      const transactionsStored = await this.storeTransactions(walletId, chain, transactions, database)
+        .catch((err) => {
+          console.error(`[WalletScanner] storeTransactions error for ${walletId}:`, err);
+          return 0;
+        });
+
       const [firstFunderResult, depositResult, p2pResult] = await Promise.all([
         this.firstFunderScanner
           .extractFromTransactions(walletId, wallet.address, transactions, chain)
           .catch((err) => {
-            console.error(`[WalletScanner] firstFunder extractor error for ${walletId}:`, err);
+            console.error(`[WalletScanner] firstFunder error for ${walletId}:`, err);
             return { walletId, chain, found: false, error: String(err) };
           }),
         this.depositScanner
           .scanTransactions(walletId, transactions, chain)
           .catch((err) => {
-            console.error(`[WalletScanner] deposit extractor error for ${walletId}:`, err);
+            console.error(`[WalletScanner] deposit error for ${walletId}:`, err);
             return { walletId, chain, depositsFound: 0, evidenceIds: [] };
           }),
         this.p2pScanner
           .scanTransactions(walletId, wallet.address, transactions, chain)
           .catch((err) => {
-            console.error(`[WalletScanner] p2p extractor error for ${walletId}:`, err);
+            console.error(`[WalletScanner] p2p error for ${walletId}:`, err);
             return { walletId, chain, matchesFound: 0 };
           }),
       ]);
 
-      // 4. Update wallet scan state
-      //    (firstFunderScanner.extractFromTransactions already updates lastScannedAt,
-      //     but we ensure it's set even if first funder wasn't found)
       await database
         .update(wallets)
         .set({
           lastScannedAt: new Date(),
-          ...(fetchResult.toBlock !== undefined
-            ? { lastScannedBlock: fetchResult.toBlock }
-            : {}),
+          ...(fetchResult.toBlock !== undefined ? { lastScannedBlock: fetchResult.toBlock } : {}),
         })
         .where(eq(wallets.id, walletId));
 
-      // Determine reasons for deep_scan recommendation
-      const deepScanReasons: DeepScanReason[] = [];
-      if (fetchResult.partial) {
-        deepScanReasons.push('gap_in_history');
-      }
-      if (fetchResult.partial && depositResult.depositsFound === 0) {
-        deepScanReasons.push('no_deposits_in_window');
-      }
-
-      // Auto-enqueue deep_scan if needed and this is not already a deep scan
-      if (deepScanReasons.length > 0 && !opts?.deepScan) {
-        const { enqueueJob } = await import('../queue/index.js');
-        await enqueueJob(walletId, chain, 'deep_scan', {}).catch((err: unknown) => {
-          console.warn(`[WalletScanner] failed to enqueue deep_scan for ${walletId}:`, err);
-        });
-        console.info(
-          `[WalletScanner] deep_scan queued for ${walletId} on ${chain} — reasons: ${deepScanReasons.join(', ')}`,
-        );
-      }
-
       return {
-        walletId,
-        chain,
+        walletId, chain,
         transactionsFetched: fetchResult.totalFetched,
+        transactionsStored,
         partial: fetchResult.partial,
-        deepScanReasons,
         firstFunderFound: firstFunderResult.found,
+        funderAddress: (firstFunderResult as { funderAddress?: string }).funderAddress,
         depositEvidenceFound: depositResult.depositsFound,
         p2pMatchesFound: p2pResult.matchesFound,
         durationMs: Date.now() - startMs,
@@ -173,86 +209,73 @@ export class WalletScanner {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[WalletScanner] scanWallet error for ${walletId} on ${chain}:`, err);
       return {
-        walletId,
-        chain,
-        transactionsFetched: 0,
-        firstFunderFound: false,
-        depositEvidenceFound: 0,
-        p2pMatchesFound: 0,
-        partial: false,
-        deepScanReasons: [],
-        durationMs: Date.now() - startMs,
+        walletId, chain,
+        transactionsFetched: 0, transactionsStored: 0,
+        firstFunderFound: false, depositEvidenceFound: 0, p2pMatchesFound: 0,
+        partial: false, durationMs: Date.now() - startMs,
         error: message,
       };
     }
   }
 
-  /**
-   * Delta scan: fetch only transactions since lastScannedBlock, run all three
-   * extractors on the new data, update scan state.
-   *
-   * Falls back to a full scan if lastScannedBlock is null (wallet never scanned).
-   */
+  // ---------------------------------------------------------------------------
+  // Delta scan
+  // ---------------------------------------------------------------------------
+
   async deltaScanWallet(walletId: string, chain: ChainSlug): Promise<WalletScanResult> {
     const startMs = Date.now();
     const database = this.getDbFn();
 
     try {
-      // 1. Load wallet — need address and lastScannedBlock
       const [wallet] = await database
-        .select({
-          address: wallets.address,
-          lastScannedBlock: wallets.lastScannedBlock,
-        })
+        .select({ address: wallets.address, lastScannedBlock: wallets.lastScannedBlock })
         .from(wallets)
         .where(eq(wallets.id, walletId))
         .limit(1);
 
       if (!wallet) {
         return {
-          walletId,
-          chain,
-          transactionsFetched: 0,
-          firstFunderFound: false,
-          depositEvidenceFound: 0,
-          p2pMatchesFound: 0,
-          partial: false,
-          deepScanReasons: [],
-          durationMs: Date.now() - startMs,
+          walletId, chain,
+          transactionsFetched: 0, transactionsStored: 0,
+          firstFunderFound: false, depositEvidenceFound: 0, p2pMatchesFound: 0,
+          partial: false, durationMs: Date.now() - startMs,
           error: `Wallet ${walletId} not found`,
         };
       }
 
-      // 2. If never scanned before, fall through to full scan
       if (wallet.lastScannedBlock === null) {
-        console.info(`[WalletScanner] deltaScanWallet: no lastScannedBlock for ${walletId}, falling back to full scan`);
         return this.scanWallet(walletId, chain);
       }
 
-      // 3. Fetch only new transactions since lastScannedBlock + 1
       const fromBlock = BigInt(wallet.lastScannedBlock) + 1n;
       const fetcher = new WalletTransactionFetcher(chain);
       const fetchResult = await fetcher.fetchAll(wallet.address, { fromBlock });
 
-      // 4. Early return if no new transactions
+      await database
+        .update(wallets)
+        .set({
+          lastScannedAt: new Date(),
+          ...(fetchResult.toBlock !== undefined ? { lastScannedBlock: fetchResult.toBlock } : {}),
+        })
+        .where(eq(wallets.id, walletId));
+
       if (fetchResult.transactions.length === 0) {
-        console.info(`[WalletScanner] deltaScanWallet: no new txs for ${walletId} since block ${wallet.lastScannedBlock}`);
         return {
-          walletId,
-          chain,
-          transactionsFetched: 0,
-          firstFunderFound: false,
-          depositEvidenceFound: 0,
-          p2pMatchesFound: 0,
-          partial: false,
-          deepScanReasons: [],
-          durationMs: Date.now() - startMs,
+          walletId, chain,
+          transactionsFetched: 0, transactionsStored: 0,
+          firstFunderFound: false, depositEvidenceFound: 0, p2pMatchesFound: 0,
+          partial: false, durationMs: Date.now() - startMs,
         };
       }
 
       const { transactions } = fetchResult;
 
-      // 5. Run all three extractors on new transactions
+      const transactionsStored = await this.storeTransactions(walletId, chain, transactions, database)
+        .catch((err) => {
+          console.error(`[WalletScanner] deltaScan storeTransactions error for ${walletId}:`, err);
+          return 0;
+        });
+
       const [firstFunderResult, depositResult, p2pResult] = await Promise.all([
         this.firstFunderScanner
           .extractFromTransactions(walletId, wallet.address, transactions, chain)
@@ -274,23 +297,11 @@ export class WalletScanner {
           }),
       ]);
 
-      // 6. Update lastScannedAt and lastScannedBlock to the highest block seen
-      await database
-        .update(wallets)
-        .set({
-          lastScannedAt: new Date(),
-          ...(fetchResult.toBlock !== undefined
-            ? { lastScannedBlock: fetchResult.toBlock }
-            : {}),
-        })
-        .where(eq(wallets.id, walletId));
-
       return {
-        walletId,
-        chain,
+        walletId, chain,
         transactionsFetched: fetchResult.totalFetched,
-        partial: false, // delta scans don't produce partials
-        deepScanReasons: [],
+        transactionsStored,
+        partial: false,
         firstFunderFound: firstFunderResult.found,
         depositEvidenceFound: depositResult.depositsFound,
         p2pMatchesFound: p2pResult.matchesFound,
@@ -301,53 +312,49 @@ export class WalletScanner {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[WalletScanner] deltaScanWallet error for ${walletId} on ${chain}:`, err);
       return {
-        walletId,
-        chain,
-        transactionsFetched: 0,
-        firstFunderFound: false,
-        depositEvidenceFound: 0,
-        p2pMatchesFound: 0,
-        partial: false,
-        deepScanReasons: [],
-        durationMs: Date.now() - startMs,
+        walletId, chain,
+        transactionsFetched: 0, transactionsStored: 0,
+        firstFunderFound: false, depositEvidenceFound: 0, p2pMatchesFound: 0,
+        partial: false, durationMs: Date.now() - startMs,
         error: message,
       };
     }
   }
 
-  /**
-   * Batch delta scan with configurable concurrency.
-   */
-  async deltaScanBatch(
+  // ---------------------------------------------------------------------------
+  // Batch helpers
+  // ---------------------------------------------------------------------------
+
+  async deltaScanBatch(walletIds: string[], chain: ChainSlug, opts?: { concurrency?: number }): Promise<BatchScanResult> {
+    return this._runBatch(walletIds, chain, opts?.concurrency, (id) => this.deltaScanWallet(id, chain));
+  }
+
+  async scanBatch(walletIds: string[], chain: ChainSlug, opts?: { concurrency?: number }): Promise<BatchScanResult> {
+    return this._runBatch(walletIds, chain, opts?.concurrency, (id) => this.scanWallet(id, chain));
+  }
+
+  private async _runBatch(
     walletIds: string[],
     chain: ChainSlug,
-    opts?: { concurrency?: number },
+    concurrency = env.SCANNER_CONCURRENCY,
+    scan: (id: string) => Promise<WalletScanResult>,
   ): Promise<BatchScanResult> {
-    const concurrency = opts?.concurrency ?? env.SCANNER_CONCURRENCY;
     const startMs = Date.now();
     const results: WalletScanResult[] = [];
-    let scanned = 0;
-    let skipped = 0;
-    let errors = 0;
-    let totalTxs = 0;
-    let totalFirstFunders = 0;
-    let totalDeposits = 0;
-    let totalP2P = 0;
+    let scanned = 0, skipped = 0, errors = 0;
+    let totalTxs = 0, totalStored = 0, totalFirstFunders = 0, totalDeposits = 0, totalP2P = 0;
 
     for (let i = 0; i < walletIds.length; i += concurrency) {
       const chunk = walletIds.slice(i, i + concurrency);
-      const chunkResults = await Promise.all(chunk.map((id) => this.deltaScanWallet(id, chain)));
+      const chunkResults = await Promise.all(chunk.map(scan));
 
       for (const result of chunkResults) {
         results.push(result);
-        if (result.error) {
-          errors++;
-        } else if (result.transactionsFetched === 0) {
-          skipped++; // up to date or no new txs
-        } else {
-          scanned++;
-        }
+        if (result.error) errors++;
+        else if (result.transactionsFetched === 0) skipped++;
+        else scanned++;
         totalTxs += result.transactionsFetched;
+        totalStored += result.transactionsStored;
         if (result.firstFunderFound) totalFirstFunders++;
         totalDeposits += result.depositEvidenceFound;
         totalP2P += result.p2pMatchesFound;
@@ -355,11 +362,9 @@ export class WalletScanner {
     }
 
     return {
-      chain,
-      scanned,
-      skipped,
-      errors,
+      chain, scanned, skipped, errors,
       totalTransactionsFetched: totalTxs,
+      totalTransactionsStored: totalStored,
       totalFirstFundersFound: totalFirstFunders,
       totalDepositEvidenceFound: totalDeposits,
       totalP2PMatchesFound: totalP2P,
@@ -368,118 +373,32 @@ export class WalletScanner {
     };
   }
 
-  /**
-   * Batch scan with configurable concurrency.
-   */
-  async scanBatch(
-    walletIds: string[],
-    chain: ChainSlug,
-    opts?: { concurrency?: number },
-  ): Promise<BatchScanResult> {
-    const concurrency = opts?.concurrency ?? env.SCANNER_CONCURRENCY;
-    const startMs = Date.now();
-    const results: WalletScanResult[] = [];
-    let scanned = 0;
-    let skipped = 0;
-    let errors = 0;
-    let totalTxs = 0;
-    let totalFirstFunders = 0;
-    let totalDeposits = 0;
-    let totalP2P = 0;
-
-    for (let i = 0; i < walletIds.length; i += concurrency) {
-      const chunk = walletIds.slice(i, i + concurrency);
-      const chunkResults = await Promise.all(chunk.map((id) => this.scanWallet(id, chain)));
-
-      for (const result of chunkResults) {
-        results.push(result);
-        if (result.error) {
-          errors++;
-        } else {
-          scanned++;
-        }
-        totalTxs += result.transactionsFetched;
-        if (result.firstFunderFound) totalFirstFunders++;
-        totalDeposits += result.depositEvidenceFound;
-        totalP2P += result.p2pMatchesFound;
-      }
-    }
-
-    return {
-      chain,
-      scanned,
-      skipped,
-      errors,
-      totalTransactionsFetched: totalTxs,
-      totalFirstFundersFound: totalFirstFunders,
-      totalDepositEvidenceFound: totalDeposits,
-      totalP2PMatchesFound: totalP2P,
-      durationMs: Date.now() - startMs,
-      results,
-    };
-  }
-
-  /**
-   * Get wallet IDs not yet fully scanned on this chain.
-   */
   async getUnscannedWallets(chain: ChainSlug, limit: number): Promise<string[]> {
-    const database = this.getDbFn();
-
-    const rows = await database
+    const rows = await this.getDbFn()
       .select({ id: wallets.id })
       .from(wallets)
       .where(and(eq(wallets.chain, chain), isNull(wallets.lastScannedAt)))
       .limit(limit);
-
     return rows.map((r) => r.id);
   }
 
-  /**
-   * Get wallet IDs due for rescan on this chain (not scanned within interval).
-   */
   async getWalletsDueForRescan(chain: ChainSlug, intervalHours: number, limit = 10000): Promise<string[]> {
-    const database = this.getDbFn();
     const cutoff = new Date(Date.now() - intervalHours * 60 * 60 * 1000);
-
-    const rows = await database
+    const rows = await this.getDbFn()
       .select({ id: wallets.id })
       .from(wallets)
-      .where(
-        and(
-          eq(wallets.chain, chain),
-          or(
-            isNull(wallets.lastScannedAt),
-            lt(wallets.lastScannedAt, cutoff),
-          ),
-        ),
-      )
+      .where(and(eq(wallets.chain, chain), or(isNull(wallets.lastScannedAt), lt(wallets.lastScannedAt, cutoff))))
       .orderBy(sql`${wallets.lastScannedAt} ASC NULLS FIRST`)
       .limit(limit);
-
     return rows.map((r) => r.id);
   }
 
-  /**
-   * Count wallets due for rescan on this chain using SELECT COUNT(*).
-   * More efficient than getWalletsDueForRescan when only the count is needed (M5).
-   */
   async countWalletsDueForRescan(chain: ChainSlug, intervalHours: number): Promise<number> {
-    const database = this.getDbFn();
     const cutoff = new Date(Date.now() - intervalHours * 60 * 60 * 1000);
-
-    const result = await database
+    const result = await this.getDbFn()
       .select({ value: count() })
       .from(wallets)
-      .where(
-        and(
-          eq(wallets.chain, chain),
-          or(
-            isNull(wallets.lastScannedAt),
-            lt(wallets.lastScannedAt, cutoff),
-          ),
-        ),
-      );
-
+      .where(and(eq(wallets.chain, chain), or(isNull(wallets.lastScannedAt), lt(wallets.lastScannedAt, cutoff))));
     return result[0]?.value ?? 0;
   }
 }

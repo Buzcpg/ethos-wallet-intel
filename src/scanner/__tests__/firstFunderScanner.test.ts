@@ -3,16 +3,11 @@ import { FirstFunderScanner } from '../firstFunderScanner.js';
 import type { RawTransaction } from '../../chains/transactionFetcher.js';
 
 function makeDb(signalExists = false) {
-  let selectCount = 0;
   return {
     select: () => ({
       from: () => ({
         where: () => ({
-          limit: async () => {
-            selectCount++;
-            if (selectCount === 1) return signalExists ? [{ id: 'sig' }] : [];
-            return [{ address: '0xwallet' }];
-          },
+          limit: async () => signalExists ? [{ id: 'sig' }] : [],
         }),
       }),
     }),
@@ -22,16 +17,16 @@ function makeDb(signalExists = false) {
 }
 
 describe('FirstFunderScanner', () => {
-  it('skips wallet when signal already exists', async () => {
+  it('skips extraction when signal already exists', async () => {
     const scanner = new FirstFunderScanner(() => makeDb(true));
-    const result = await scanner.scanWallet('wallet-id', 'ethereum');
+    const result = await scanner.extractFromTransactions('wallet-id', '0xwallet', [], 'ethereum');
     expect(result.skipped).toBe(true);
     expect(result.found).toBe(true);
   });
 
-  it('returns not-found (legacy adapter path removed)', async () => {
+  it('returns not-found when no qualifying inbound tx', async () => {
     const scanner = new FirstFunderScanner(() => makeDb(false));
-    const result = await scanner.scanWallet('wallet-id', 'ethereum');
+    const result = await scanner.extractFromTransactions('wallet-id', '0xwallet', [], 'ethereum');
     expect(result.found).toBe(false);
   });
 

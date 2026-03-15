@@ -241,11 +241,11 @@ describe('WalletScanner', () => {
       walletId: WALLET_ID,
       chain: CHAIN,
       transactionsFetched: 10,
+      transactionsStored: 10,
       firstFunderFound: true,
       depositEvidenceFound: 1,
       p2pMatchesFound: 0,
       partial: false,
-      deepScanReasons: [],
       durationMs: 100,
     });
 
